@@ -239,8 +239,8 @@ int ue4j_writer_close(ue4j_writer_t *w)
     int count = w->count;
     if (w->fp) {
         fprintf(w->fp, "\n  ]\n}\n");
-        fflush(w->fp);
-        fclose(w->fp);
+        if (fflush(w->fp) != 0 || ferror(w->fp)) count = -1;
+        if (fclose(w->fp) != 0) count = -1;
         chown(w->path, 501, 501);
     }
     free(w);

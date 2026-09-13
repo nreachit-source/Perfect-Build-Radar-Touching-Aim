@@ -111,6 +111,10 @@ static void parse_config(uint64_t *guobj_out, uint64_t *gnames_out)
 /*  Public API                                                         */
 /* ------------------------------------------------------------------ */
 
+static void write_class(void *writer, const ue4_class_t *cls) {
+    ue4j_writer_write_class(writer, cls);
+}
+
 int ue4_sdk_generate(pid_t target_pid)
 {
     int result = -1;
@@ -161,23 +165,28 @@ int ue4_sdk_generate(pid_t target_pid)
     sdk_log("reflection context initialised");
 
     /* ---- stream classes to JSON (< 500 KB peak memory) ---------- */
-    ue4j_writer_t *writer = ue4j_writer_open(UE4_SDK_OUTPUT_PATH);
+    /* A failed read must not replace the last successful dump. */
+    const char *pending_path = UE4_SDK_OUTPUT_PATH ".tmp";
+    ue4j_writer_t *writer = ue4j_writer_open(pending_path);
     if (!writer) {
         sdk_log("ERROR: failed to open JSON writer for %s", UE4_SDK_OUTPUT_PATH);
+        remove(pending_path);
         goto out_ctx;
     }
 
-    int count = ue4r_iterate_classes(ctx, (ue4r_class_callback_t)ue4j_writer_write_class, writer);
+    int count = ue4r_iterate_classes(ctx, write_class, writer);
     int written = ue4j_writer_close(writer);
 
     sdk_log("classes found: %d", count);
-    if (count > 0 && written == count) {
+    if (count > 0 && written == count &&
+        rename(pending_path, UE4_SDK_OUTPUT_PATH) == 0) {
         sdk_log("JSON written to %s", UE4_SDK_OUTPUT_PATH);
         result = 0;
     } else {
         sdk_log("ERROR: class iteration or JSON write failed (found=%d, written=%d)", count, written);
         result = -1;
     }
+    if (result != 0) remove(pending_path);
 
 out_ctx:
     ue4r_destroy(ctx);

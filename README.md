@@ -56,6 +56,15 @@ If the file is absent or keys are missing, the generator attempts auto-detection
 
 ## Building
 
+For the Windows Zig cross-compiler workflow, run `python tools/build_local.py`.
+It compiles the daemon (including `radar_reader.c`), the overlay, and an isolated
+SDK regression executable with warnings treated as errors. It validates the
+Mach-O load commands and sets the iOS platform and minimum version before
+writing unsigned artifacts to `../build_codex/`. Signing and deployment are
+separate steps. Use `--zig` and `--out` to override local paths.
+
+See [CONTINUATION.md](CONTINUATION.md) for device findings and remaining work.
+
 The daemon is an ARM64 iOS command-line Mach-O. Compile all `.c` files in `source/daemon/` against an iOS SDK:
 
 ```sh

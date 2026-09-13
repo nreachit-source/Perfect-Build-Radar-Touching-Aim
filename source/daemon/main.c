@@ -139,12 +139,16 @@ int main(int argc, char **argv) {
     hold_daemon_transaction();
     raise_jetsam_limit();
 
+    if (argc == 3 && strcmp(argv[1], "--dump-once") == 0) {
+        pid_t pid = (pid_t)atoi(argv[2]);
+        return pid > 0 && ue4_sdk_generate(pid) == 0 ? 0 : 1;
+    }
+
     if (argc > 1) {
         pid_t direct_pid = (pid_t)atoi(argv[1]);
         if (direct_pid > 0) {
             write_marker();
-            ue4_sdk_generate(direct_pid);
-            /* After SDK dump, start continuous radar */
+            /* Live mode uses the existing schema/offsets; never dumps. */
             run_radar_loop(direct_pid);
             return 0;
         }
@@ -156,9 +160,9 @@ int main(int argc, char **argv) {
         if (pid != 0 && pid != last_reported_pid) {
             if (write_marker() == 0) {
                 last_reported_pid = pid;
-                ue4_sdk_generate(pid);
                 /* Start radar loop — blocks until game exits */
                 run_radar_loop(pid);
+                last_reported_pid = 0;
             }
         } else if (pid == 0) {
             last_reported_pid = 0;
@@ -167,4 +171,3 @@ int main(int argc, char **argv) {
     }
     return 0;
 }
-

@@ -19,6 +19,7 @@
 #include "remote_memory.h"
 #include "pattern_scan.h"
 #include "ue4_offsets.h"
+#include "config_address.h"
 
 /* -----------------------------------------------------------------------
  * FNamePool layout constants (common for UE 4.25–4.27, may need tuning)
@@ -52,6 +53,10 @@ struct ue4r_ctx {
     uint64_t    gname_chunk_table; /* Resolved chunk table base pointer              */
     uint64_t    cached_chunks[32]; /* Cached chunk base pointers                     */
     uint64_t    uclass_class;      /* Address of the UClass whose name is "Class"    */
+    uint64_t lookup_keys[256];
+    unsigned char lookup_matches[256];
+    uint64_t lookup_class;
+    char lookup_name[64];
     name_cache_slot_t name_cache[NAME_CACHE_SIZE]; /* 512 KB direct-mapped cache   */
 };
 
@@ -677,11 +682,7 @@ ue4r_ctx_t *ue4r_init(mach_port_t task,
 
     /* ----- Resolve GUObjectArray address ----- */
     if (guobj_off != 0) {
-        if (guobj_off >= 0x100000000ULL) {
-            ctx->guobjectarray = guobj_off + slide;
-        } else {
-            ctx->guobjectarray = image_base + guobj_off;
-        }
+        ctx->guobjectarray = config_runtime_address(guobj_off, image_base, slide);
     } else {
         ctx->guobjectarray = try_find_guobjectarray(task, image_base, slide);
         if (ctx->guobjectarray == 0) {
@@ -692,11 +693,7 @@ ue4r_ctx_t *ue4r_init(mach_port_t task,
 
     /* ----- Resolve FNamePool / GNames address ----- */
     if (gnames_off != 0) {
-        if (gnames_off >= 0x100000000ULL) {
-            ctx->gnamepool = gnames_off + slide;
-        } else {
-            ctx->gnamepool = image_base + gnames_off;
-        }
+        ctx->gnamepool = config_runtime_address(gnames_off, image_base, slide);
     } else {
         ctx->gnamepool = try_find_gnamepool(task, image_base, slide);
         if (ctx->gnamepool == 0) {
@@ -709,6 +706,11 @@ ue4r_ctx_t *ue4r_init(mach_port_t task,
     uint32_t val0 = 0;
     rm_read(task, ctx->gnamepool, &val0, sizeof(val0));
     uint32_t deref_count = (val0 >= 100) ? (val0 - 100) / 3 : 0;
+    if (deref_count > 16) {
+        fprintf(stderr, "[ue4r] invalid GNames indirection count; check config/build\n");
+        free(ctx);
+        return NULL;
+    }
     uint64_t ptr = rm_read_ptr(task, ctx->gnamepool + 8);
     if (!ptr) ptr = rm_read_ptr(task, ctx->gnamepool);
     for (uint32_t i = 0; i < deref_count; i++) {
@@ -737,6 +739,48 @@ ue4r_ctx_t *ue4r_init(mach_port_t task,
 /* =======================================================================
  * Class enumeration
  * ======================================================================= */
+
+bool ue4r_ready(const ue4r_ctx_t *ctx) {
+    return ctx && ctx->uclass_class != 0;
+}
+
+uint64_t ue4r_find_instance(ue4r_ctx_t *ctx, const char *name, int32_t *cursor) {
+    if (!ue4r_ready(ctx) || !name || !cursor || *cursor < 0) return 0;
+    int32_t count=0;
+    uint64_t objects=get_objects_info(ctx,&count);
+    if(!objects || count<=0 || count>MAX_OBJECTS){*cursor=-1;return 0;}
+    if(strcmp(ctx->lookup_name,name)) {
+        snprintf(ctx->lookup_name,sizeof(ctx->lookup_name),"%s",name);
+        ctx->lookup_class=0;memset(ctx->lookup_keys,0,sizeof(ctx->lookup_keys));*cursor=0;
+    }
+    int budget=16384;
+    while(*cursor<count && budget-->0) {
+        uint64_t obj=read_object_from_array(ctx,objects,(*cursor)++);
+        if(!rm_validate_ptr(obj))continue;
+        struct {uint64_t vtable;uint32_t flags,index;uint64_t cls;} header;
+        if(!rm_read(ctx->task,obj,&header,sizeof(header)))continue;
+        if(!ctx->lookup_class) {
+            if(header.cls!=ctx->uclass_class)continue;
+            char candidate[256];
+            if(resolve_object_name(ctx,obj,candidate,sizeof(candidate)) && !strcmp(candidate,name)) {
+                ctx->lookup_class=obj;*cursor=0;
+            }
+        } else if(!(header.flags&0x10)) {
+            unsigned slot=(unsigned)((header.cls>>4)&255);
+            if(ctx->lookup_keys[slot]!=header.cls) {
+                uint64_t cls=header.cls;bool match=false;
+                for(int depth=0;depth<32 && rm_validate_ptr(cls);depth++) {
+                    if(cls==ctx->lookup_class){match=true;break;}
+                    cls=rm_read_ptr(ctx->task,cls+OFF_USTRUCT_SUPER);
+                }
+                ctx->lookup_keys[slot]=header.cls;ctx->lookup_matches[slot]=match;
+            }
+            if(ctx->lookup_matches[slot])return obj;
+        }
+    }
+    if(*cursor>=count)*cursor=-1;
+    return 0;
+}
 
 ue4_class_t *ue4r_walk_classes(ue4r_ctx_t *ctx)
 {

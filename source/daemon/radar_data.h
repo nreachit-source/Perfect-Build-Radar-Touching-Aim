@@ -12,7 +12,7 @@
 
 #define RADAR_FILE_PATH   "/var/mobile/Downloads/ue4_radar.bin"
 #define RADAR_MAGIC       0x52444152  /* "RDAR" */
-#define RADAR_VERSION     1
+#define RADAR_VERSION     3
 #define RADAR_MAX_PLAYERS 100
 #define RADAR_NUM_BONES   20
 
@@ -28,7 +28,11 @@ typedef struct {
     rvec3_t  local_pos;
     rvec3_t  local_rot;   /* pitch, yaw, roll (degrees) */
     float    camera_fov;
-    float    _pad[3];
+    uint32_t sequence;    /* odd while writer is publishing */
+    uint32_t status;      /* 0 offline, 1 initializing, 2 ready, 3 no local pawn */
+    rvec3_t camera_pos;
+    uint32_t camera_valid;
+    uint32_t local_team;  /* 0 means unknown */
 } radar_header_t;
 
 typedef struct {

@@ -84,4 +84,8 @@ void ue4r_free_classes(ue4_class_t *list);
 /* Destroy the context. */
 void ue4r_destroy(ue4r_ctx_t *ctx);
 
+/* Runtime object lookup only; does not generate or write a schema. */
+bool ue4r_ready(const ue4r_ctx_t *ctx);
+uint64_t ue4r_find_instance(ue4r_ctx_t *ctx, const char *class_name, int32_t *cursor);
+
 #endif /* UE4_REFLECTION_H */
