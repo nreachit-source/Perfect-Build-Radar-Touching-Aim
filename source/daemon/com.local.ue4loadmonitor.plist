@@ -4,6 +4,10 @@
 <dict>
     <key>Label</key>
     <string>com.local.ue4loadmonitor</string>
+    <key>POSIXSpawnType</key>
+    <string>Interactive</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
     <key>ProgramArguments</key>
     <array>
         <string>/var/jb/usr/local/libexec/ue4loadmonitor</string>
@@ -14,10 +18,6 @@
     <true/>
     <key>UserName</key>
     <string>root</string>
-    <key>EnableTransactions</key>
-    <false/>
-    <key>EnablePressuredExit</key>
-    <false/>
     <key>ThrottleInterval</key>
     <integer>5</integer>
 </dict>
