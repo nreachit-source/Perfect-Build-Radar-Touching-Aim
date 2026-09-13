@@ -10,6 +10,9 @@
 #include <dlfcn.h>
 
 #include "ue4_sdk.h"
+#include "radar_reader.h"
+#include "remote_memory.h"
+#include "aslr_slide.h"
 
 static const char kTargetExecutable[] = "ShadowTrackerExtra";
 static const char kDownloadsDirectory[] = "/var/mobile/Downloads";
@@ -62,8 +65,6 @@ static pid_t find_target_process(void) {
     const size_t count = length / sizeof(struct kinfo_proc);
     pid_t result = 0;
     for (size_t index = 0; index < count; ++index) {
-        /* Darwin p_comm is bounded by MAXCOMLEN. Compare only that field and
-         * discard every nonmatching process without logging or retaining it. */
         if (strncmp(processes[index].kp_proc.p_comm,
                     kTargetExecutable, MAXCOMLEN) == 0) {
             result = processes[index].kp_proc.p_pid;
@@ -102,6 +103,35 @@ static int write_marker(void) {
     return 0;
 }
 
+/* Run continuous radar reading loop at ~20Hz until process exits. */
+static void run_radar_loop(pid_t target_pid) {
+    mach_port_t task = rm_task_acquire(target_pid);
+    if (task == MACH_PORT_NULL) return;
+
+    aslr_result_t aslr = aslr_get_slide(task);
+    if (!aslr.found) {
+        rm_task_release(task);
+        return;
+    }
+
+    if (radar_init(task, aslr.base, aslr.slide) != 0) {
+        rm_task_release(task);
+        return;
+    }
+
+    while (gRunning) {
+        /* Check if target process is still alive */
+        pid_t cur = find_target_process();
+        if (cur != target_pid) break;
+
+        radar_tick();
+        usleep(50000);  /* 50ms = 20 Hz */
+    }
+
+    radar_destroy();
+    rm_task_release(task);
+}
+
 int main(int argc, char **argv) {
     signal(SIGTERM, stop_handler);
     signal(SIGINT, stop_handler);
@@ -113,8 +143,10 @@ int main(int argc, char **argv) {
         pid_t direct_pid = (pid_t)atoi(argv[1]);
         if (direct_pid > 0) {
             write_marker();
-            int res = ue4_sdk_generate(direct_pid);
-            return (res == 0) ? 0 : 1;
+            ue4_sdk_generate(direct_pid);
+            /* After SDK dump, start continuous radar */
+            run_radar_loop(direct_pid);
+            return 0;
         }
     }
 
@@ -124,11 +156,9 @@ int main(int argc, char **argv) {
         if (pid != 0 && pid != last_reported_pid) {
             if (write_marker() == 0) {
                 last_reported_pid = pid;
-                /* Trigger the external SDK generator once per new PID.
-                 * This is a best-effort operation — if it fails, the
-                 * daemon continues monitoring.  Diagnostic details are
-                 * written to /var/mobile/Downloads/ue4_sdk.log. */
                 ue4_sdk_generate(pid);
+                /* Start radar loop — blocks until game exits */
+                run_radar_loop(pid);
             }
         } else if (pid == 0) {
             last_reported_pid = 0;
@@ -137,3 +167,4 @@ int main(int argc, char **argv) {
     }
     return 0;
 }
+
