@@ -753,7 +753,7 @@ uint64_t ue4r_find_instance(ue4r_ctx_t *ctx, const char *name, int32_t *cursor) 
         snprintf(ctx->lookup_name,sizeof(ctx->lookup_name),"%s",name);
         ctx->lookup_class=0;memset(ctx->lookup_keys,0,sizeof(ctx->lookup_keys));*cursor=0;
     }
-    int budget=16384;
+    int budget=512;
     while(*cursor<count && budget-->0) {
         uint64_t obj=read_object_from_array(ctx,objects,(*cursor)++);
         if(!rm_validate_ptr(obj))continue;

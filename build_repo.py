@@ -7,7 +7,7 @@ import shutil
 
 
 HERE = pathlib.Path(__file__).resolve().parent
-SOURCE = HERE.parent / "com.local.ue4loadmonitor_1.3.2_iphoneos-arm64.deb"
+SOURCE = HERE.parent / "com.local.ue4loadmonitor_1.3.0_iphoneos-arm64.deb"
 POOL = HERE / "debs"
 DEB = POOL / SOURCE.name
 
@@ -35,7 +35,7 @@ def main() -> None:
 
     package = f"""Package: com.local.ue4loadmonitor
 Name: UE4 Load Monitor
-Version: 1.3.2
+Version: 1.3.0
 Architecture: iphoneos-arm64
 Description: UE4 process detector, SDK exporter, and live radar overlay.
 Maintainer: Local Development
