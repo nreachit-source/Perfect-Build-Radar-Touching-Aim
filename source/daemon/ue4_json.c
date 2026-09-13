@@ -173,3 +173,76 @@ int ue4j_write(const char *path, const ue4_class_t *classes)
 
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/*  Streaming Writer Implementation                                    */
+/* ------------------------------------------------------------------ */
+
+struct ue4j_writer {
+    FILE *fp;
+    char  path[1024];
+    int   count;
+    char  fbuf[65536];
+};
+
+ue4j_writer_t *ue4j_writer_open(const char *path)
+{
+    if (!path) return NULL;
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return NULL;
+
+    FILE *fp = fdopen(fd, "w");
+    if (!fp) {
+        close(fd);
+        return NULL;
+    }
+
+    ue4j_writer_t *w = calloc(1, sizeof(*w));
+    if (!w) {
+        fclose(fp);
+        return NULL;
+    }
+
+    w->fp = fp;
+    strncpy(w->path, path, sizeof(w->path) - 1);
+    setvbuf(fp, w->fbuf, _IOFBF, sizeof(w->fbuf));
+
+    /* header */
+    fprintf(fp, "{\n");
+    fprintf(fp, "  \"format\": \"ue4-reflection-schema-v1\",\n");
+    fprintf(fp, "  \"scope\": \"type metadata only; no object values\",\n");
+    fprintf(fp, "  \"classes\": [\n");
+
+    return w;
+}
+
+int ue4j_writer_write_class(ue4j_writer_t *w, const ue4_class_t *cls)
+{
+    if (!w || !w->fp || !cls) return -1;
+
+    if (w->count > 0) {
+        fputs(",\n", w->fp);
+    }
+
+    int res = json_write_class(w->fp, cls, 1);
+    if (res == 0) {
+        w->count++;
+    }
+    return res;
+}
+
+int ue4j_writer_close(ue4j_writer_t *w)
+{
+    if (!w) return -1;
+
+    int count = w->count;
+    if (w->fp) {
+        fprintf(w->fp, "\n  ]\n}\n");
+        fflush(w->fp);
+        fclose(w->fp);
+        chown(w->path, 501, 501);
+    }
+    free(w);
+    return count;
+}

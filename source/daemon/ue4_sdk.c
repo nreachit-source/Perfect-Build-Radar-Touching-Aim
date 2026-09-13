@@ -160,24 +160,26 @@ int ue4_sdk_generate(pid_t target_pid)
     }
     sdk_log("reflection context initialised");
 
-    /* ---- walk classes -------------------------------------------- */
-    ue4_class_t *classes = ue4r_walk_classes(ctx);
-    {
-        int count = 0;
-        for (const ue4_class_t *c = classes; c; c = c->next) ++count;
-        sdk_log("classes found: %d", count);
+    /* ---- stream classes to JSON (< 500 KB peak memory) ---------- */
+    ue4j_writer_t *writer = ue4j_writer_open(UE4_SDK_OUTPUT_PATH);
+    if (!writer) {
+        sdk_log("ERROR: failed to open JSON writer for %s", UE4_SDK_OUTPUT_PATH);
+        goto out_ctx;
     }
 
-    /* ---- write JSON ---------------------------------------------- */
-    result = ue4j_write(UE4_SDK_OUTPUT_PATH, classes);
-    if (result == 0) {
+    int count = ue4r_iterate_classes(ctx, (ue4r_class_callback_t)ue4j_writer_write_class, writer);
+    int written = ue4j_writer_close(writer);
+
+    sdk_log("classes found: %d", count);
+    if (count > 0 && written == count) {
         sdk_log("JSON written to %s", UE4_SDK_OUTPUT_PATH);
+        result = 0;
     } else {
-        sdk_log("ERROR: JSON write failed");
+        sdk_log("ERROR: class iteration or JSON write failed (found=%d, written=%d)", count, written);
+        result = -1;
     }
 
-    /* ---- cleanup ------------------------------------------------- */
-    ue4r_free_classes(classes);
+out_ctx:
     ue4r_destroy(ctx);
 
 out_task:

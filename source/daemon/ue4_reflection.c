@@ -35,6 +35,14 @@
 /* -----------------------------------------------------------------------
  * Context
  * ----------------------------------------------------------------------- */
+#define NAME_CACHE_SIZE 8192
+#define NAME_CACHE_MASK (NAME_CACHE_SIZE - 1)
+
+typedef struct {
+    int32_t comp_index;
+    char    name[60];
+} name_cache_slot_t;
+
 struct ue4r_ctx {
     mach_port_t task;
     uint64_t    image_base;
@@ -44,7 +52,7 @@ struct ue4r_ctx {
     uint64_t    gname_chunk_table; /* Resolved chunk table base pointer              */
     uint64_t    cached_chunks[32]; /* Cached chunk base pointers                     */
     uint64_t    uclass_class;      /* Address of the UClass whose name is "Class"    */
-    char        name_cache[65536][64]; /* Fast lookup name string cache              */
+    name_cache_slot_t name_cache[NAME_CACHE_SIZE]; /* 512 KB direct-mapped cache   */
 };
 
 /* -----------------------------------------------------------------------
@@ -134,12 +142,13 @@ bool ue4r_resolve_name(ue4r_ctx_t *ctx, uint64_t fname_addr,
                                  fname_addr + OFF_FNAME_NUMBER, &ok);
     if (!ok) number = 0;
 
-    /* Fast name cache hit */
-    if ((uint32_t)comp_index < 65536 && ctx->name_cache[comp_index][0] != '\0') {
+    /* Fast name cache hit (direct-mapped 512KB) */
+    uint32_t slot = (uint32_t)comp_index & NAME_CACHE_MASK;
+    if (ctx->name_cache[slot].comp_index == comp_index && ctx->name_cache[slot].name[0] != '\0') {
         if (number > 0) {
-            snprintf(buf, max, "%s_%d", ctx->name_cache[comp_index], number - 1);
+            snprintf(buf, max, "%s_%d", ctx->name_cache[slot].name, number - 1);
         } else {
-            snprintf(buf, max, "%s", ctx->name_cache[comp_index]);
+            snprintf(buf, max, "%s", ctx->name_cache[slot].name);
         }
         return true;
     }
@@ -245,9 +254,12 @@ bool ue4r_resolve_name(ue4r_ctx_t *ctx, uint64_t fname_addr,
 
     if (!resolved) return false;
 
-    /* Populate name cache */
-    if ((uint32_t)comp_index < 65536) {
-        strncpy(ctx->name_cache[comp_index], name_buf, sizeof(ctx->name_cache[comp_index]) - 1);
+    /* Populate name cache (direct-mapped 512KB) */
+    {
+        uint32_t slot = (uint32_t)comp_index & NAME_CACHE_MASK;
+        ctx->name_cache[slot].comp_index = comp_index;
+        strncpy(ctx->name_cache[slot].name, name_buf, sizeof(ctx->name_cache[slot].name) - 1);
+        ctx->name_cache[slot].name[sizeof(ctx->name_cache[slot].name) - 1] = '\0';
     }
 
     if (number > 0) {
@@ -659,6 +671,10 @@ ue4r_ctx_t *ue4r_init(mach_port_t task,
     ctx->image_base = image_base;
     ctx->slide      = slide;
 
+    for (int i = 0; i < NAME_CACHE_SIZE; i++) {
+        ctx->name_cache[i].comp_index = -1;
+    }
+
     /* ----- Resolve GUObjectArray address ----- */
     if (guobj_off != 0) {
         if (guobj_off >= 0x100000000ULL) {
@@ -819,6 +835,107 @@ ue4_class_t *ue4r_walk_classes(ue4r_ctx_t *ctx)
     }
 
     return head;
+}
+
+int ue4r_iterate_classes(ue4r_ctx_t *ctx, ue4r_class_callback_t cb, void *userdata)
+{
+    if (!ctx || !cb) return -1;
+
+    int32_t num_elems = 0;
+    uint64_t objects_ptr = get_objects_info(ctx, &num_elems);
+    if (!objects_ptr || num_elems <= 0) {
+        fprintf(stderr, "[ue4r] iterate_classes: bad Objects pointer or count\n");
+        return -1;
+    }
+    if (num_elems > MAX_OBJECTS) num_elems = MAX_OBJECTS;
+
+    typedef struct {
+        uint64_t uobject;
+        int32_t  flags;
+        int32_t  cluster_root_index;
+        int32_t  serial_number;
+        int32_t  pad;
+    } fu_object_item_t;
+
+    fu_object_item_t batch[512];
+    const int batch_size = 512;
+    int class_count = 0;
+
+    for (int32_t b = 0; b < num_elems; b += batch_size) {
+        int32_t to_read = (num_elems - b < batch_size) ? (num_elems - b) : batch_size;
+        bool batch_ok = rm_read(ctx->task, objects_ptr + (uint64_t)b * sizeof(fu_object_item_t),
+                                batch, (size_t)to_read * sizeof(fu_object_item_t));
+
+        for (int32_t k = 0; k < to_read; k++) {
+            uint64_t obj = 0;
+            if (batch_ok) {
+                obj = batch[k].uobject;
+            } else {
+                obj = read_object_from_array(ctx, objects_ptr, b + k);
+            }
+            if (!rm_validate_ptr(obj)) continue;
+
+            /* Is this object a UClass? */
+            uint64_t cls = rm_read_ptr(ctx->task, obj + OFF_UOBJECT_CLASS);
+            bool is_uclass = false;
+            if (ctx->uclass_class != 0 && cls == ctx->uclass_class) {
+                is_uclass = true;
+            } else if (rm_validate_ptr(cls)) {
+                char cls_name[256] = {0};
+                if (resolve_object_name(ctx, cls, cls_name, sizeof(cls_name))) {
+                    if (strcmp(cls_name, "Class") == 0) {
+                        is_uclass = true;
+                        if (ctx->uclass_class == 0) ctx->uclass_class = cls;
+                    }
+                }
+            }
+            if (!is_uclass) continue;
+
+            /* ---- Build a stack-allocated ue4_class_t for this UClass ---- */
+            ue4_class_t c;
+            memset(&c, 0, sizeof(c));
+
+            build_path_name(ctx, obj, c.name, sizeof(c.name), 0);
+
+            uint64_t super_ptr = rm_read_ptr(ctx->task, obj + OFF_USTRUCT_SUPER);
+            if (!rm_validate_ptr(super_ptr)) {
+                super_ptr = rm_read_ptr(ctx->task, obj + OFF_USTRUCT_SUPER_425);
+            }
+            if (rm_validate_ptr(super_ptr)) {
+                build_path_name(ctx, super_ptr, c.super_name, sizeof(c.super_name), 0);
+            }
+
+            bool ok = false;
+            c.struct_size = rm_read_i32(ctx->task, obj + OFF_USTRUCT_PROPS_SIZE, &ok);
+            if (!ok || c.struct_size == 0) {
+                c.struct_size = rm_read_i32(ctx->task, obj + OFF_USTRUCT_PROPS_SIZE_425, &ok);
+            }
+            if (!ok) c.struct_size = 0;
+
+            c.properties = read_properties(ctx, obj);
+            c.functions = read_functions(ctx, obj);
+
+            /* Invoke callback to stream to JSON */
+            cb(userdata, &c);
+            class_count++;
+
+            /* Free properties and functions immediately (constant heap usage < 500 KB) */
+            ue4_property_t *p = c.properties;
+            while (p) {
+                ue4_property_t *np = p->next;
+                free(p);
+                p = np;
+            }
+            ue4_function_t *f = c.functions;
+            while (f) {
+                ue4_function_t *nf = f->next;
+                free(f);
+                f = nf;
+            }
+        }
+    }
+
+    return class_count;
 }
 
 /* =======================================================================

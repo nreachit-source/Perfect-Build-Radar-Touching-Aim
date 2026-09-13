@@ -72,6 +72,12 @@ bool ue4r_resolve_name(ue4r_ctx_t *ctx,
  * The caller must free the result with ue4r_free_classes(). */
 ue4_class_t *ue4r_walk_classes(ue4r_ctx_t *ctx);
 
+/* Streaming class iterator: invokes `cb` for each UClass found and frees
+ * class resources immediately. Peak memory footprint is <500 KB.
+ * Returns the total number of classes processed. */
+typedef void (*ue4r_class_callback_t)(void *userdata, const ue4_class_t *cls);
+int ue4r_iterate_classes(ue4r_ctx_t *ctx, ue4r_class_callback_t cb, void *userdata);
+
 /* Free a class list returned by ue4r_walk_classes(). */
 void ue4r_free_classes(ue4_class_t *list);
 

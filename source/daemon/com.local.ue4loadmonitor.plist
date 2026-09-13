@@ -20,5 +20,16 @@
     <string>root</string>
     <key>ThrottleInterval</key>
     <integer>5</integer>
+    <key>EnableTransactions</key>
+    <false/>
+    <key>EnablePressuredExit</key>
+    <false/>
+    <key>JetsamMemoryLimit</key>
+    <integer>104857600</integer>
+    <key>JetsamProperties</key>
+    <dict>
+        <key>JetsamMemoryLimit</key>
+        <integer>100</integer>
+    </dict>
 </dict>
 </plist>

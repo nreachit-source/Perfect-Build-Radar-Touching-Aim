@@ -18,4 +18,11 @@
  * Returns 0 on success, -1 on failure. */
 int ue4j_write(const char *path, const ue4_class_t *classes);
 
+/* Streaming writer interface (constant <1MB memory footprint) */
+typedef struct ue4j_writer ue4j_writer_t;
+
+ue4j_writer_t *ue4j_writer_open(const char *path);
+int ue4j_writer_write_class(ue4j_writer_t *w, const ue4_class_t *cls);
+int ue4j_writer_close(ue4j_writer_t *w);
+
 #endif /* UE4_JSON_H */

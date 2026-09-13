@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <dlfcn.h>
 
 #include "ue4_sdk.h"
 
@@ -17,6 +18,24 @@ static const char kMarkerPath[] =
 static const char kMarkerText[] = "I have loaded. I am running.\n";
 
 static volatile sig_atomic_t gRunning = 1;
+static void *g_daemon_txn = NULL;
+
+static void hold_daemon_transaction(void) {
+    typedef void *(*txn_create_fn)(const char *);
+    txn_create_fn create_fn = (txn_create_fn)dlsym(RTLD_DEFAULT, "os_transaction_create");
+    if (create_fn) {
+        g_daemon_txn = create_fn("com.local.ue4loadmonitor");
+    }
+}
+
+static void raise_jetsam_limit(void) {
+    typedef int (*memo_ctrl_fn)(uint32_t, int32_t, uint32_t, void *, size_t);
+    memo_ctrl_fn fn = (memo_ctrl_fn)dlsym(RTLD_DEFAULT, "memorystatus_control");
+    if (fn) {
+        /* MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK = 4, set to 128 MB */
+        fn(4, getpid(), 128, NULL, 0);
+    }
+}
 
 static void stop_handler(int signal_number) {
     (void)signal_number;
@@ -87,6 +106,9 @@ int main(int argc, char **argv) {
     signal(SIGTERM, stop_handler);
     signal(SIGINT, stop_handler);
 
+    hold_daemon_transaction();
+    raise_jetsam_limit();
+
     if (argc > 1) {
         pid_t direct_pid = (pid_t)atoi(argv[1]);
         if (direct_pid > 0) {
@@ -111,7 +133,7 @@ int main(int argc, char **argv) {
         } else if (pid == 0) {
             last_reported_pid = 0;
         }
-        usleep(500000);
+        sleep(1);
     }
     return 0;
 }
