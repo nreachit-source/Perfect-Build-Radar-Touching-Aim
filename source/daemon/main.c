@@ -83,9 +83,18 @@ static int write_marker(void) {
     return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     signal(SIGTERM, stop_handler);
     signal(SIGINT, stop_handler);
+
+    if (argc > 1) {
+        pid_t direct_pid = (pid_t)atoi(argv[1]);
+        if (direct_pid > 0) {
+            write_marker();
+            int res = ue4_sdk_generate(direct_pid);
+            return (res == 0) ? 0 : 1;
+        }
+    }
 
     pid_t last_reported_pid = 0;
     while (gRunning != 0) {

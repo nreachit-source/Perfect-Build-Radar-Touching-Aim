@@ -39,9 +39,10 @@ struct ue4r_ctx {
     mach_port_t task;
     uint64_t    image_base;
     uint64_t    slide;
-    uint64_t    guobjectarray;  /* Runtime address of GUObjectArray               */
-    uint64_t    gnamepool;      /* Runtime address of FNamePool (GNames)          */
-    uint64_t    uclass_class;   /* Address of the UClass whose name is "Class"    */
+    uint64_t    guobjectarray;     /* Runtime address of GUObjectArray               */
+    uint64_t    gnamepool;         /* Runtime address of FNamePool (GNames)          */
+    uint64_t    gname_chunk_table; /* Resolved chunk table base pointer              */
+    uint64_t    uclass_class;      /* Address of the UClass whose name is "Class"    */
 };
 
 /* -----------------------------------------------------------------------
@@ -138,13 +139,16 @@ bool ue4r_resolve_name(ue4r_ctx_t *ctx, uint64_t fname_addr,
     uint32_t chunk_idx = (uint32_t)comp_index / 16384;
     uint32_t offset_in_chunk = (uint32_t)comp_index % 16384;
 
-    uint64_t chunk_tables[4];
-    chunk_tables[0] = ctx->gnamepool;
-    chunk_tables[1] = rm_read_ptr(ctx->task, ctx->gnamepool);
-    chunk_tables[2] = rm_read_ptr(ctx->task, ctx->gnamepool + 8);
-    chunk_tables[3] = (chunk_tables[2] != 0) ? rm_read_ptr(ctx->task, chunk_tables[2]) : 0;
+    uint64_t chunk_tables[6];
+    int n_tables = 0;
+    if (rm_validate_ptr(ctx->gname_chunk_table)) {
+        chunk_tables[n_tables++] = ctx->gname_chunk_table;
+    }
+    chunk_tables[n_tables++] = ctx->gnamepool;
+    chunk_tables[n_tables++] = rm_read_ptr(ctx->task, ctx->gnamepool);
+    chunk_tables[n_tables++] = rm_read_ptr(ctx->task, ctx->gnamepool + 8);
 
-    for (int t = 0; t < 4 && !resolved; t++) {
+    for (int t = 0; t < n_tables && !resolved; t++) {
         uint64_t table = chunk_tables[t];
         if (!rm_validate_ptr(table)) continue;
 
@@ -286,7 +290,11 @@ static void build_path_name(ue4r_ctx_t *ctx, uint64_t obj_addr,
         snprintf(buf, max, "%s.%s", outer_path, name);
     } else {
         /* No outer — this is a top-level package */
-        snprintf(buf, max, "/%s", name);
+        if (name[0] == '/') {
+            snprintf(buf, max, "%s", name);
+        } else {
+            snprintf(buf, max, "/%s", name);
+        }
     }
 }
 
@@ -641,6 +649,20 @@ ue4r_ctx_t *ue4r_init(mach_port_t task,
         }
     }
 
+    /* ----- Resolve GNames chunk table (dereference chain) ----- */
+    uint32_t val0 = 0;
+    rm_read(task, ctx->gnamepool, &val0, sizeof(val0));
+    uint32_t deref_count = (val0 >= 100) ? (val0 - 100) / 3 : 0;
+    uint64_t ptr = rm_read_ptr(task, ctx->gnamepool + 8);
+    if (!ptr) ptr = rm_read_ptr(task, ctx->gnamepool);
+    for (uint32_t i = 0; i < deref_count; i++) {
+        if (!rm_validate_ptr(ptr)) break;
+        ptr = rm_read_ptr(task, ptr);
+    }
+    ctx->gname_chunk_table = ptr;
+    fprintf(stderr, "[ue4r] GNames chunk table: 0x%llx (val0=0x%x, derefs=%u)\n",
+            (unsigned long long)ctx->gname_chunk_table, val0, deref_count);
+
     /* ----- Locate the UClass meta-class ("Class" whose class is itself) --- */
     ctx->uclass_class = find_uclass_class(ctx);
     if (ctx->uclass_class == 0) {
@@ -675,63 +697,85 @@ ue4_class_t *ue4r_walk_classes(ue4r_ctx_t *ctx)
     ue4_class_t *head = NULL;
     ue4_class_t *tail = NULL;
 
-    for (int32_t i = 0; i < num_elems; i++) {
-        uint64_t obj = read_object_from_array(ctx, objects_ptr, i);
-        if (!rm_validate_ptr(obj)) continue;
+    typedef struct {
+        uint64_t uobject;
+        int32_t  flags;
+        int32_t  cluster_root_index;
+        int32_t  serial_number;
+        int32_t  pad;
+    } fu_object_item_t;
 
-        /* Is this object a UClass? */
-        uint64_t cls = rm_read_ptr(ctx->task, obj + OFF_UOBJECT_CLASS);
-        bool is_uclass = false;
-        if (ctx->uclass_class != 0 && cls == ctx->uclass_class) {
-            is_uclass = true;
-        } else if (rm_validate_ptr(cls)) {
-            char cls_name[256] = {0};
-            if (resolve_object_name(ctx, cls, cls_name, sizeof(cls_name))) {
-                if (strcmp(cls_name, "Class") == 0) {
-                    is_uclass = true;
-                    if (ctx->uclass_class == 0) ctx->uclass_class = cls;
+    fu_object_item_t batch[512];
+    const int batch_size = 512;
+
+    for (int32_t b = 0; b < num_elems; b += batch_size) {
+        int32_t to_read = (num_elems - b < batch_size) ? (num_elems - b) : batch_size;
+        bool batch_ok = rm_read(ctx->task, objects_ptr + (uint64_t)b * sizeof(fu_object_item_t),
+                                batch, (size_t)to_read * sizeof(fu_object_item_t));
+
+        for (int32_t k = 0; k < to_read; k++) {
+            uint64_t obj = 0;
+            if (batch_ok) {
+                obj = batch[k].uobject;
+            } else {
+                obj = read_object_from_array(ctx, objects_ptr, b + k);
+            }
+            if (!rm_validate_ptr(obj)) continue;
+
+            /* Is this object a UClass? */
+            uint64_t cls = rm_read_ptr(ctx->task, obj + OFF_UOBJECT_CLASS);
+            bool is_uclass = false;
+            if (ctx->uclass_class != 0 && cls == ctx->uclass_class) {
+                is_uclass = true;
+            } else if (rm_validate_ptr(cls)) {
+                char cls_name[256] = {0};
+                if (resolve_object_name(ctx, cls, cls_name, sizeof(cls_name))) {
+                    if (strcmp(cls_name, "Class") == 0) {
+                        is_uclass = true;
+                        if (ctx->uclass_class == 0) ctx->uclass_class = cls;
+                    }
                 }
             }
+            if (!is_uclass) continue;
+
+            /* ---- Build a ue4_class_t for this UClass ---- */
+            ue4_class_t *c = calloc(1, sizeof(*c));
+            if (!c) break;
+
+            /* Full path name (e.g. "/Script/Engine.Actor") */
+            build_path_name(ctx, obj, c->name, sizeof(c->name), 0);
+
+            /* SuperStruct path name */
+            uint64_t super_ptr = rm_read_ptr(ctx->task, obj + OFF_USTRUCT_SUPER);
+            if (!rm_validate_ptr(super_ptr)) {
+                super_ptr = rm_read_ptr(ctx->task, obj + OFF_USTRUCT_SUPER_425);
+            }
+            if (rm_validate_ptr(super_ptr)) {
+                build_path_name(ctx, super_ptr, c->super_name,
+                                sizeof(c->super_name), 0);
+            } else {
+                c->super_name[0] = '\0';
+            }
+
+            /* PropertiesSize (int32) */
+            bool ok = false;
+            c->struct_size = rm_read_i32(ctx->task, obj + OFF_USTRUCT_PROPS_SIZE, &ok);
+            if (!ok || c->struct_size == 0) {
+                c->struct_size = rm_read_i32(ctx->task, obj + OFF_USTRUCT_PROPS_SIZE_425, &ok);
+            }
+            if (!ok) c->struct_size = 0;
+
+            /* Property list (FProperty chain via ChildProperties) */
+            c->properties = read_properties(ctx, obj);
+
+            /* Function list (UField chain via Children, filtered) */
+            c->functions = read_functions(ctx, obj);
+
+            /* Append to result list */
+            c->next = NULL;
+            if (tail) { tail->next = c; tail = c; }
+            else      { head = tail = c; }
         }
-        if (!is_uclass) continue;
-
-        /* ---- Build a ue4_class_t for this UClass ---- */
-        ue4_class_t *c = calloc(1, sizeof(*c));
-        if (!c) break;
-
-        /* Full path name (e.g. "/Script/Engine.Actor") */
-        build_path_name(ctx, obj, c->name, sizeof(c->name), 0);
-
-        /* SuperStruct path name */
-        uint64_t super_ptr = rm_read_ptr(ctx->task, obj + OFF_USTRUCT_SUPER);
-        if (!rm_validate_ptr(super_ptr)) {
-            super_ptr = rm_read_ptr(ctx->task, obj + OFF_USTRUCT_SUPER_425);
-        }
-        if (rm_validate_ptr(super_ptr)) {
-            build_path_name(ctx, super_ptr, c->super_name,
-                            sizeof(c->super_name), 0);
-        } else {
-            c->super_name[0] = '\0';
-        }
-
-        /* PropertiesSize (int32) */
-        bool ok = false;
-        c->struct_size = rm_read_i32(ctx->task, obj + OFF_USTRUCT_PROPS_SIZE, &ok);
-        if (!ok || c->struct_size == 0) {
-            c->struct_size = rm_read_i32(ctx->task, obj + OFF_USTRUCT_PROPS_SIZE_425, &ok);
-        }
-        if (!ok) c->struct_size = 0;
-
-        /* Property list (FProperty chain via ChildProperties) */
-        c->properties = read_properties(ctx, obj);
-
-        /* Function list (UField chain via Children, filtered) */
-        c->functions = read_functions(ctx, obj);
-
-        /* Append to result list */
-        c->next = NULL;
-        if (tail) { tail->next = c; tail = c; }
-        else      { head = tail = c; }
     }
 
     return head;
