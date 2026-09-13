@@ -8,6 +8,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "ue4_sdk.h"
+
 static const char kTargetExecutable[] = "ShadowTrackerExtra";
 static const char kDownloadsDirectory[] = "/var/mobile/Downloads";
 static const char kMarkerPath[] =
@@ -41,8 +43,8 @@ static pid_t find_target_process(void) {
     const size_t count = length / sizeof(struct kinfo_proc);
     pid_t result = 0;
     for (size_t index = 0; index < count; ++index) {
-        // Darwin p_comm is bounded by MAXCOMLEN. Compare only that field and
-        // discard every nonmatching process without logging or retaining it.
+        /* Darwin p_comm is bounded by MAXCOMLEN. Compare only that field and
+         * discard every nonmatching process without logging or retaining it. */
         if (strncmp(processes[index].kp_proc.p_comm,
                     kTargetExecutable, MAXCOMLEN) == 0) {
             result = processes[index].kp_proc.p_pid;
@@ -89,7 +91,14 @@ int main(void) {
     while (gRunning != 0) {
         const pid_t pid = find_target_process();
         if (pid != 0 && pid != last_reported_pid) {
-            if (write_marker() == 0) last_reported_pid = pid;
+            if (write_marker() == 0) {
+                last_reported_pid = pid;
+                /* Trigger the external SDK generator once per new PID.
+                 * This is a best-effort operation — if it fails, the
+                 * daemon continues monitoring.  Diagnostic details are
+                 * written to /var/mobile/Downloads/ue4_sdk.log. */
+                ue4_sdk_generate(pid);
+            }
         } else if (pid == 0) {
             last_reported_pid = 0;
         }
