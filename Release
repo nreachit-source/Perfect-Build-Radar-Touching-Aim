@@ -1,0 +1,16 @@
+Origin: UE4 Load Monitor
+Label: UE4 Load Monitor
+Suite: stable
+Codename: ios
+Architectures: iphoneos-arm64
+Components: main
+Description: Private UE4 monitor development repository
+MD5Sum:
+ c91091a0f322b8133869a163ce42431e              517 Packages
+ 08eee2303d189c9726abbb16ce16b2a9              363 Packages.gz
+SHA1:
+ 214a936468e3c4f3691f3cb8485cf284d38bf2a8              517 Packages
+ 54ef0f9625780c2498eba9db3edc48f96ab5af42              363 Packages.gz
+SHA256:
+ f5fd35082cff417da659c0feccfaa80ad42ef61475b2fee8943000abfe51ae72              517 Packages
+ b35c54aa1e74498628f29b339f1d40f4fbd21d430acb8cb5e63ffa2774d4822e              363 Packages.gz
