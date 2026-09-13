@@ -30,7 +30,7 @@
 #define MAX_OBJECTS         500000
 #define MAX_LIST_WALK       1000
 #define MAX_PATH_DEPTH      10
-#define MAX_INIT_SCAN_OBJS  512     /* How many objects to scan when looking for the "Class" UClass */
+#define MAX_INIT_SCAN_OBJS  8192    /* How many objects to scan when looking for the "Class" UClass */
 
 /* -----------------------------------------------------------------------
  * Context
@@ -125,68 +125,87 @@ bool ue4r_resolve_name(ue4r_ctx_t *ctx, uint64_t fname_addr,
     bool ok = false;
     int32_t comp_index = rm_read_i32(ctx->task,
                                      fname_addr + OFF_FNAME_INDEX, &ok);
-    if (!ok) return false;
+    if (!ok || comp_index < 0) return false;
 
     int32_t number = rm_read_i32(ctx->task,
                                  fname_addr + OFF_FNAME_NUMBER, &ok);
-    if (!ok) return false;
+    if (!ok) number = 0;
 
-    /* 2. Decode block index and offset within the block */
-    uint32_t block_index    = (uint32_t)comp_index >> FNAME_BLOCK_OFFSET_BITS;
-    uint32_t offset_in_block = (uint32_t)comp_index &
-                               ((1u << FNAME_BLOCK_OFFSET_BITS) - 1u);
+    char name_buf[1024] = {0};
+    bool resolved = false;
 
-    /* 3. Read the block pointer from the FNamePool block array */
-    uint64_t block_array_addr = ctx->gnamepool + FNAMEPOOL_BLOCKS_OFFSET;
-    uint64_t block_ptr = rm_read_ptr(ctx->task,
-                                     block_array_addr + (uint64_t)block_index * 8);
-    if (!rm_validate_ptr(block_ptr)) return false;
+    /* --- Strategy A: UE 4.18 TNameEntryArray (chunked array of FNameEntry*) --- */
+    uint32_t chunk_idx = (uint32_t)comp_index / 16384;
+    uint32_t offset_in_chunk = (uint32_t)comp_index % 16384;
 
-    /* 4. Compute the entry address (offset counts in stride-2 units) */
-    uint64_t entry_addr = block_ptr +
-                          (uint64_t)offset_in_block * FNAME_ENTRY_STRIDE;
+    uint64_t chunk_tables[4];
+    chunk_tables[0] = ctx->gnamepool;
+    chunk_tables[1] = rm_read_ptr(ctx->task, ctx->gnamepool);
+    chunk_tables[2] = rm_read_ptr(ctx->task, ctx->gnamepool + 8);
+    chunk_tables[3] = (chunk_tables[2] != 0) ? rm_read_ptr(ctx->task, chunk_tables[2]) : 0;
 
-    /* 5. Read the FNameEntry header (uint16) */
-    uint16_t header = rm_read_u16(ctx->task, entry_addr, &ok);
-    if (!ok) return false;
+    for (int t = 0; t < 4 && !resolved; t++) {
+        uint64_t table = chunk_tables[t];
+        if (!rm_validate_ptr(table)) continue;
 
-    /* 6. Decode wide flag and string length */
-    bool is_wide = (header & FNAMEENTRY_HEADER_WIDE_MASK) != 0;
-    uint16_t len = header >> FNAMEENTRY_HEADER_LEN_SHIFT;
+        uint64_t chunk_ptr = rm_read_ptr(ctx->task, table + (uint64_t)chunk_idx * 8);
+        if (!rm_validate_ptr(chunk_ptr)) continue;
 
-    /* Sanity-check length */
-    if (len == 0 || len > 1024) return false;
+        uint64_t entry_ptr = rm_read_ptr(ctx->task, chunk_ptr + (uint64_t)offset_in_chunk * 8);
+        if (!rm_validate_ptr(entry_ptr)) continue;
 
-    uint64_t str_addr = entry_addr + FNAMEENTRY_HEADER_SIZE;
-
-    /* 7. Temporary buffer for the raw name chars */
-    size_t name_cap = (len < max - 1) ? len : (max - 1);
-    char name_buf[1024];
-    if (name_cap > sizeof(name_buf) - 1)
-        name_cap = sizeof(name_buf) - 1;
-
-    if (!is_wide) {
-        /* ANSI path: read `len` bytes directly */
-        if (!rm_read(ctx->task, str_addr, name_buf, name_cap))
-            return false;
-        name_buf[name_cap] = '\0';
-    } else {
-        /* Wide (UTF-16LE) path: read len * 2 bytes, take low byte of each */
-        size_t wide_bytes = (size_t)len * 2;
-        uint8_t wide_buf[2048];
-        if (wide_bytes > sizeof(wide_buf))
-            wide_bytes = sizeof(wide_buf);
-        if (!rm_read(ctx->task, str_addr, wide_buf, wide_bytes))
-            return false;
-
-        size_t copy_len = (size_t)len;
-        if (copy_len > name_cap) copy_len = name_cap;
-        for (size_t i = 0; i < copy_len; i++)
-            name_buf[i] = (char)wide_buf[i * 2]; /* low byte of each wchar */
-        name_buf[copy_len] = '\0';
+        uint16_t flags = rm_read_u16(ctx->task, entry_ptr + 8, &ok);
+        bool is_wide = ok && ((flags & 1) != 0);
+        if (!is_wide) {
+            if (rm_read_string(ctx->task, entry_ptr + 0x0c, name_buf, sizeof(name_buf))) {
+                if (name_buf[0] != '\0') {
+                    resolved = true;
+                }
+            }
+        } else {
+            uint8_t wide_buf[512] = {0};
+            if (rm_read(ctx->task, entry_ptr + 0x0c, wide_buf, sizeof(wide_buf))) {
+                for (size_t i = 0; i < sizeof(name_buf) - 1 && i < 256; i++) {
+                    char c = (char)wide_buf[i * 2];
+                    if (c == '\0') break;
+                    name_buf[i] = c;
+                }
+                if (name_buf[0] != '\0') {
+                    resolved = true;
+                }
+            }
+        }
     }
 
-    /* 8. Append "_N" suffix when Number > 0  (Number is stored as N+1) */
+    /* --- Strategy B: UE 4.23+ FNamePool fallback --- */
+    if (!resolved) {
+        uint32_t block_index = (uint32_t)comp_index >> FNAME_BLOCK_OFFSET_BITS;
+        uint32_t offset_in_block = (uint32_t)comp_index & ((1u << FNAME_BLOCK_OFFSET_BITS) - 1u);
+        uint64_t block_array_addr = ctx->gnamepool + FNAMEPOOL_BLOCKS_OFFSET;
+        uint64_t block_ptr = rm_read_ptr(ctx->task, block_array_addr + (uint64_t)block_index * 8);
+        if (rm_validate_ptr(block_ptr)) {
+            uint64_t entry_addr = block_ptr + (uint64_t)offset_in_block * FNAME_ENTRY_STRIDE;
+            uint16_t header = rm_read_u16(ctx->task, entry_addr, &ok);
+            if (ok) {
+                bool is_wide = (header & FNAMEENTRY_HEADER_WIDE_MASK) != 0;
+                uint16_t len = header >> FNAMEENTRY_HEADER_LEN_SHIFT;
+                if (len > 0 && len <= 1024) {
+                    uint64_t str_addr = entry_addr + FNAMEENTRY_HEADER_SIZE;
+                    size_t name_cap = (len < max - 1) ? len : (max - 1);
+                    if (name_cap > sizeof(name_buf) - 1) name_cap = sizeof(name_buf) - 1;
+                    if (!is_wide) {
+                        if (rm_read(ctx->task, str_addr, name_buf, name_cap)) {
+                            name_buf[name_cap] = '\0';
+                            resolved = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!resolved) return false;
+
     if (number > 0) {
         char suffix[32];
         snprintf(suffix, sizeof(suffix), "_%d", number - 1);
@@ -197,7 +216,6 @@ bool ue4r_resolve_name(ue4r_ctx_t *ctx, uint64_t fname_addr,
         }
     }
 
-    /* 9. Copy to caller buffer */
     snprintf(buf, max, "%s", name_buf);
     return true;
 }
@@ -284,61 +302,99 @@ static void build_path_name(ue4r_ctx_t *ctx, uint64_t obj_addr,
  */
 static ue4_property_t *read_properties(ue4r_ctx_t *ctx, uint64_t class_addr)
 {
-    uint64_t prop_ptr = rm_read_ptr(ctx->task,
-                                    class_addr + OFF_USTRUCT_CHILD_PROPS);
+    /* UE 4.18 has properties in Children (+0x38). UE 4.25 has ChildProperties (+0x50) or Children (+0x48). */
+    uint64_t prop_ptr = rm_read_ptr(ctx->task, class_addr + OFF_USTRUCT_CHILDREN);
+    if (!rm_validate_ptr(prop_ptr)) {
+        prop_ptr = rm_read_ptr(ctx->task, class_addr + OFF_USTRUCT_CHILD_PROPS);
+    }
+    if (!rm_validate_ptr(prop_ptr)) {
+        prop_ptr = rm_read_ptr(ctx->task, class_addr + OFF_USTRUCT_CHILDREN_425);
+    }
 
     ue4_property_t *head = NULL;
     ue4_property_t *tail = NULL;
     int count = 0;
 
     while (rm_validate_ptr(prop_ptr) && count < MAX_LIST_WALK) {
-        ue4_property_t *p = calloc(1, sizeof(*p));
-        if (!p) break;
-
-        /* --- Name (FField::NamePrivate is an FName) --- */
-        if (!ue4r_resolve_name(ctx, prop_ptr + OFF_FFIELD_NAME,
-                               p->name, sizeof(p->name))) {
-            snprintf(p->name, sizeof(p->name), "<unknown>");
+        /* Check if UProperty (UE 4.18) or FProperty (UE 4.25+) */
+        uint64_t uclass = rm_read_ptr(ctx->task, prop_ptr + OFF_UOBJECT_CLASS);
+        char type_buf[256] = {0};
+        bool is_uproperty = false;
+        bool is_ufield = false;
+        if (rm_validate_ptr(uclass)) {
+            is_ufield = true;
+            if (ue4r_resolve_name(ctx, uclass + OFF_UOBJECT_NAME, type_buf, sizeof(type_buf))) {
+                if (strstr(type_buf, "Property")) {
+                    is_uproperty = true;
+                }
+            }
         }
 
-        /* --- Type name from FFieldClass --- */
-        uint64_t fclass = rm_read_ptr(ctx->task,
-                                      prop_ptr + OFF_FFIELD_CLASS);
-        if (rm_validate_ptr(fclass)) {
-            /*
-             * FFieldClass stores an FName at offset 0 (OFF_FFIELDCLASS_NAME).
-             * This gives us the property type name (e.g. "FloatProperty").
-             */
-            if (!ue4r_resolve_name(ctx, fclass + OFF_FFIELDCLASS_NAME,
-                                   p->type, sizeof(p->type))) {
+        if (is_uproperty) {
+            ue4_property_t *p = calloc(1, sizeof(*p));
+            if (!p) break;
+
+            /* --- UProperty path (UE 4.18) --- */
+            snprintf(p->type, sizeof(p->type), "%s", type_buf);
+            if (!ue4r_resolve_name(ctx, prop_ptr + OFF_UOBJECT_NAME, p->name, sizeof(p->name))) {
+                snprintf(p->name, sizeof(p->name), "<unknown>");
+            }
+            bool ok;
+            p->array_dim = rm_read_i32(ctx->task, prop_ptr + 0x30, &ok);
+            p->element_size = rm_read_i32(ctx->task, prop_ptr + 0x34, &ok);
+            p->offset = rm_read_i32(ctx->task, prop_ptr + 0x44, &ok);
+            if (p->offset == 0) p->offset = rm_read_i32(ctx->task, prop_ptr + 0x4c, &ok);
+
+            prop_ptr = rm_read_ptr(ctx->task, prop_ptr + OFF_UFIELD_NEXT);
+
+            p->next = NULL;
+            if (tail) { tail->next = p; tail = p; }
+            else      { head = tail = p; }
+            count++;
+        } else if (is_ufield) {
+            /* Skip non-property UField (e.g. UFunction in Children linked list) */
+            prop_ptr = rm_read_ptr(ctx->task, prop_ptr + OFF_UFIELD_NEXT);
+        } else {
+            /* --- FProperty path (UE 4.25+) --- */
+            ue4_property_t *p = calloc(1, sizeof(*p));
+            if (!p) break;
+
+            if (!ue4r_resolve_name(ctx, prop_ptr + OFF_FFIELD_NAME,
+                                   p->name, sizeof(p->name))) {
+                snprintf(p->name, sizeof(p->name), "<unknown>");
+            }
+
+            uint64_t fclass = rm_read_ptr(ctx->task,
+                                          prop_ptr + OFF_FFIELD_CLASS);
+            if (rm_validate_ptr(fclass)) {
+                if (!ue4r_resolve_name(ctx, fclass + OFF_FFIELDCLASS_NAME,
+                                       p->type, sizeof(p->type))) {
+                    snprintf(p->type, sizeof(p->type), "Unknown");
+                }
+            } else {
                 snprintf(p->type, sizeof(p->type), "Unknown");
             }
-        } else {
-            snprintf(p->type, sizeof(p->type), "Unknown");
+
+            bool ok;
+            p->array_dim    = rm_read_i32(ctx->task,
+                                          prop_ptr + OFF_FPROP_ARRAY_DIM, &ok);
+            if (!ok) p->array_dim = 0;
+
+            p->element_size = rm_read_i32(ctx->task,
+                                          prop_ptr + OFF_FPROP_ELEMENT_SIZE, &ok);
+            if (!ok) p->element_size = 0;
+
+            p->offset       = rm_read_i32(ctx->task,
+                                          prop_ptr + OFF_FPROP_OFFSET, &ok);
+            if (!ok) p->offset = 0;
+
+            prop_ptr = rm_read_ptr(ctx->task, prop_ptr + OFF_FFIELD_NEXT);
+
+            p->next = NULL;
+            if (tail) { tail->next = p; tail = p; }
+            else      { head = tail = p; }
+            count++;
         }
-
-        /* --- Numeric fields --- */
-        bool ok;
-        p->array_dim    = rm_read_i32(ctx->task,
-                                      prop_ptr + OFF_FPROP_ARRAY_DIM, &ok);
-        if (!ok) p->array_dim = 0;
-
-        p->element_size = rm_read_i32(ctx->task,
-                                      prop_ptr + OFF_FPROP_ELEMENT_SIZE, &ok);
-        if (!ok) p->element_size = 0;
-
-        p->offset       = rm_read_i32(ctx->task,
-                                      prop_ptr + OFF_FPROP_OFFSET, &ok);
-        if (!ok) p->offset = 0;
-
-        /* Append to linked list */
-        p->next = NULL;
-        if (tail) { tail->next = p; tail = p; }
-        else      { head = tail = p; }
-
-        /* Advance to next FProperty in the linked list */
-        prop_ptr = rm_read_ptr(ctx->task, prop_ptr + OFF_FFIELD_NEXT);
-        count++;
     }
 
     return head;
@@ -356,6 +412,9 @@ static ue4_function_t *read_functions(ue4r_ctx_t *ctx, uint64_t class_addr)
 {
     uint64_t child = rm_read_ptr(ctx->task,
                                  class_addr + OFF_USTRUCT_CHILDREN);
+    if (!rm_validate_ptr(child)) {
+        child = rm_read_ptr(ctx->task, class_addr + OFF_USTRUCT_CHILDREN_425);
+    }
 
     ue4_function_t *head = NULL;
     ue4_function_t *tail = NULL;
@@ -383,12 +442,20 @@ static ue4_function_t *read_functions(ue4r_ctx_t *ctx, uint64_t class_addr)
             /* FunctionFlags (uint32) */
             bool ok;
             f->flags = (uint32_t)rm_read_i32(ctx->task,
-                                             child + OFF_UFUNC_FLAGS, &ok);
+                                             child + OFF_UFUNC_FLAGS_418, &ok);
+            if (!ok || f->flags == 0) {
+                f->flags = (uint32_t)rm_read_i32(ctx->task,
+                                                 child + OFF_UFUNC_FLAGS_425, &ok);
+            }
             if (!ok) f->flags = 0;
 
             /* ParmsSize (uint16) */
             f->parms_size = rm_read_u16(ctx->task,
-                                        child + OFF_UFUNC_PARMS_SIZE, &ok);
+                                        child + OFF_UFUNC_PARMS_SIZE_418, &ok);
+            if (!ok || f->parms_size == 0) {
+                f->parms_size = rm_read_u16(ctx->task,
+                                            child + OFF_UFUNC_PARMS_SIZE_425, &ok);
+            }
             if (!ok) f->parms_size = 0;
 
             /* Append */
@@ -421,20 +488,68 @@ static uint64_t read_object_from_array(ue4r_ctx_t *ctx,
                                        uint64_t   objects_ptr,
                                        int32_t    index)
 {
+    /* 1. Try flat FUObjectItem array (Item = objects_ptr + index * 24) */
+    uint64_t flat_item = objects_ptr + (uint64_t)index * FUOBJECTITEM_SIZE;
+    uint64_t flat_obj = rm_read_ptr(ctx->task, flat_item + FUOBJECTITEM_OBJECT);
+    if (rm_validate_ptr(flat_obj)) {
+        return flat_obj;
+    }
+
+    /* 2. Fallback: chunked array */
     int32_t chunk_index  = index / ELEMENTS_PER_CHUNK;
     int32_t within_chunk = index % ELEMENTS_PER_CHUNK;
 
-    /* Read the chunk pointer */
     uint64_t chunk_ptr = rm_read_ptr(ctx->task,
                                      objects_ptr + (uint64_t)chunk_index * 8);
-    if (!rm_validate_ptr(chunk_ptr)) return 0;
+    if (rm_validate_ptr(chunk_ptr)) {
+        uint64_t item_addr = chunk_ptr +
+                             (uint64_t)within_chunk * FUOBJECTITEM_SIZE +
+                             FUOBJECTITEM_OBJECT;
+        return rm_read_ptr(ctx->task, item_addr);
+    }
+    return 0;
+}
 
-    /* Read the UObject* from the FUObjectItem */
-    uint64_t item_addr = chunk_ptr +
-                         (uint64_t)within_chunk * FUOBJECTITEM_SIZE +
-                         FUOBJECTITEM_OBJECT;
-    uint64_t obj = rm_read_ptr(ctx->task, item_addr);
-    return obj;
+static uint64_t get_objects_info(ue4r_ctx_t *ctx, int32_t *out_count)
+{
+    bool ok = false;
+    /* Try +0x10 (ObjObjects) */
+    uint64_t chunked = ctx->guobjectarray + OFF_GUOBJ_CHUNKED;
+    uint64_t ptr = rm_read_ptr(ctx->task, chunked + OFF_CHUNKED_OBJECTS);
+    int32_t count = rm_read_i32(ctx->task, chunked + OFF_CHUNKED_NUM_ELEMS, &ok);
+    if (rm_validate_ptr(ptr) && ok && count > 0) {
+        if (out_count) *out_count = count;
+        return ptr;
+    }
+
+    /* Try count at chunked + 0x14 */
+    count = rm_read_i32(ctx->task, chunked + 0x14, &ok);
+    if (rm_validate_ptr(ptr) && ok && count > 0) {
+        if (out_count) *out_count = count;
+        return ptr;
+    }
+
+    /* Try guobjectarray + 0x10 and + 0x1c */
+    ptr = rm_read_ptr(ctx->task, ctx->guobjectarray + 0x10);
+    count = rm_read_i32(ctx->task, ctx->guobjectarray + 0x1c, &ok);
+    if (rm_validate_ptr(ptr) && ok && count > 0) {
+        if (out_count) *out_count = count;
+        return ptr;
+    }
+
+    /* Try guobjectarray + 0x00 and + 0x14 */
+    ptr = rm_read_ptr(ctx->task, ctx->guobjectarray);
+    count = rm_read_i32(ctx->task, ctx->guobjectarray + 0x14, &ok);
+    if (rm_validate_ptr(ptr) && ok && count > 0) {
+        if (out_count) *out_count = count;
+        return ptr;
+    }
+
+    if (rm_validate_ptr(ptr)) {
+        if (out_count) *out_count = 100000;
+        return ptr;
+    }
+    return 0;
 }
 
 /* =======================================================================
@@ -448,21 +563,10 @@ static uint64_t read_object_from_array(ue4r_ctx_t *ctx,
  */
 static uint64_t find_uclass_class(ue4r_ctx_t *ctx)
 {
-    /* Read the chunked array header */
-    uint64_t chunked = ctx->guobjectarray + OFF_GUOBJ_CHUNKED;
-
-    uint64_t objects_ptr = rm_read_ptr(ctx->task,
-                                       chunked + OFF_CHUNKED_OBJECTS);
-    if (!rm_validate_ptr(objects_ptr)) {
-        fprintf(stderr, "[ue4r] failed to read GUObjectArray.Objects\n");
-        return 0;
-    }
-
-    bool ok;
-    int32_t num_elems = rm_read_i32(ctx->task,
-                                    chunked + OFF_CHUNKED_NUM_ELEMS, &ok);
-    if (!ok || num_elems <= 0) {
-        fprintf(stderr, "[ue4r] failed to read GUObjectArray.NumElements\n");
+    int32_t num_elems = 0;
+    uint64_t objects_ptr = get_objects_info(ctx, &num_elems);
+    if (!objects_ptr || num_elems <= 0) {
+        fprintf(stderr, "[ue4r] failed to read GUObjectArray objects/count\n");
         return 0;
     }
 
@@ -473,20 +577,21 @@ static uint64_t find_uclass_class(ue4r_ctx_t *ctx)
         uint64_t obj = read_object_from_array(ctx, objects_ptr, i);
         if (!rm_validate_ptr(obj)) continue;
 
-        /* Check if ClassPrivate == self (meta-class property) */
         uint64_t cls = rm_read_ptr(ctx->task, obj + OFF_UOBJECT_CLASS);
-        if (cls != obj) continue;
 
-        /* Resolve the object's name */
         char name[256] = {0};
-        resolve_object_name(ctx, obj, name, sizeof(name));
-        if (strcmp(name, "Class") == 0) {
-            return obj;
+        if (resolve_object_name(ctx, obj, name, sizeof(name))) {
+            if (strcmp(name, "Class") == 0) {
+                if (cls == obj) return obj;
+                char cls_name[256] = {0};
+                if (resolve_object_name(ctx, cls, cls_name, sizeof(cls_name)) &&
+                    strcmp(cls_name, "Class") == 0) {
+                    return cls;
+                }
+            }
         }
     }
 
-    fprintf(stderr, "[ue4r] could not locate UClass(\"Class\") in first "
-                    "%d objects\n", scan_limit);
     return 0;
 }
 
@@ -508,34 +613,38 @@ ue4r_ctx_t *ue4r_init(mach_port_t task,
 
     /* ----- Resolve GUObjectArray address ----- */
     if (guobj_off != 0) {
-        ctx->guobjectarray = guobj_off + slide;
+        if (guobj_off >= 0x100000000ULL) {
+            ctx->guobjectarray = guobj_off + slide;
+        } else {
+            ctx->guobjectarray = image_base + guobj_off;
+        }
     } else {
         ctx->guobjectarray = try_find_guobjectarray(task, image_base, slide);
         if (ctx->guobjectarray == 0) {
-            fprintf(stderr, "[ue4r] GUObjectArray auto-detect failed\n");
-            free(ctx);
-            return NULL;
+            /* Fallback to known ShadowTrackerExtra pre-ASLR offset */
+            ctx->guobjectarray = image_base + 0x0aad3898ULL;
         }
     }
 
-    /* ----- Resolve FNamePool address ----- */
+    /* ----- Resolve FNamePool / GNames address ----- */
     if (gnames_off != 0) {
-        ctx->gnamepool = gnames_off + slide;
+        if (gnames_off >= 0x100000000ULL) {
+            ctx->gnamepool = gnames_off + slide;
+        } else {
+            ctx->gnamepool = image_base + gnames_off;
+        }
     } else {
         ctx->gnamepool = try_find_gnamepool(task, image_base, slide);
         if (ctx->gnamepool == 0) {
-            fprintf(stderr, "[ue4r] FNamePool auto-detect failed\n");
-            free(ctx);
-            return NULL;
+            /* Fallback to known ShadowTrackerExtra pre-ASLR offset */
+            ctx->gnamepool = image_base + 0x0a898170ULL;
         }
     }
 
     /* ----- Locate the UClass meta-class ("Class" whose class is itself) --- */
     ctx->uclass_class = find_uclass_class(ctx);
     if (ctx->uclass_class == 0) {
-        fprintf(stderr, "[ue4r] failed to locate UClass(\"Class\")\n");
-        free(ctx);
-        return NULL;
+        fprintf(stderr, "[ue4r] warning: UClass(\"Class\") not found in init scan; will use dynamic lookup\n");
     }
 
     fprintf(stderr, "[ue4r] init OK  guobj=0x%llx  gnames=0x%llx  "
@@ -555,20 +664,10 @@ ue4_class_t *ue4r_walk_classes(ue4r_ctx_t *ctx)
 {
     if (!ctx) return NULL;
 
-    /* Read the chunked object array header */
-    uint64_t chunked     = ctx->guobjectarray + OFF_GUOBJ_CHUNKED;
-    uint64_t objects_ptr = rm_read_ptr(ctx->task,
-                                       chunked + OFF_CHUNKED_OBJECTS);
-    if (!rm_validate_ptr(objects_ptr)) {
-        fprintf(stderr, "[ue4r] walk_classes: bad Objects pointer\n");
-        return NULL;
-    }
-
-    bool ok;
-    int32_t num_elems = rm_read_i32(ctx->task,
-                                    chunked + OFF_CHUNKED_NUM_ELEMS, &ok);
-    if (!ok || num_elems <= 0) {
-        fprintf(stderr, "[ue4r] walk_classes: bad NumElements\n");
+    int32_t num_elems = 0;
+    uint64_t objects_ptr = get_objects_info(ctx, &num_elems);
+    if (!objects_ptr || num_elems <= 0) {
+        fprintf(stderr, "[ue4r] walk_classes: bad Objects pointer or count\n");
         return NULL;
     }
     if (num_elems > MAX_OBJECTS) num_elems = MAX_OBJECTS;
@@ -580,9 +679,21 @@ ue4_class_t *ue4r_walk_classes(ue4r_ctx_t *ctx)
         uint64_t obj = read_object_from_array(ctx, objects_ptr, i);
         if (!rm_validate_ptr(obj)) continue;
 
-        /* Is this object a UClass?  (ClassPrivate == uclass_class) */
+        /* Is this object a UClass? */
         uint64_t cls = rm_read_ptr(ctx->task, obj + OFF_UOBJECT_CLASS);
-        if (cls != ctx->uclass_class) continue;
+        bool is_uclass = false;
+        if (ctx->uclass_class != 0 && cls == ctx->uclass_class) {
+            is_uclass = true;
+        } else if (rm_validate_ptr(cls)) {
+            char cls_name[256] = {0};
+            if (resolve_object_name(ctx, cls, cls_name, sizeof(cls_name))) {
+                if (strcmp(cls_name, "Class") == 0) {
+                    is_uclass = true;
+                    if (ctx->uclass_class == 0) ctx->uclass_class = cls;
+                }
+            }
+        }
+        if (!is_uclass) continue;
 
         /* ---- Build a ue4_class_t for this UClass ---- */
         ue4_class_t *c = calloc(1, sizeof(*c));
@@ -592,8 +703,10 @@ ue4_class_t *ue4r_walk_classes(ue4r_ctx_t *ctx)
         build_path_name(ctx, obj, c->name, sizeof(c->name), 0);
 
         /* SuperStruct path name */
-        uint64_t super_ptr = rm_read_ptr(ctx->task,
-                                         obj + OFF_USTRUCT_SUPER);
+        uint64_t super_ptr = rm_read_ptr(ctx->task, obj + OFF_USTRUCT_SUPER);
+        if (!rm_validate_ptr(super_ptr)) {
+            super_ptr = rm_read_ptr(ctx->task, obj + OFF_USTRUCT_SUPER_425);
+        }
         if (rm_validate_ptr(super_ptr)) {
             build_path_name(ctx, super_ptr, c->super_name,
                             sizeof(c->super_name), 0);
@@ -602,8 +715,11 @@ ue4_class_t *ue4r_walk_classes(ue4r_ctx_t *ctx)
         }
 
         /* PropertiesSize (int32) */
-        c->struct_size = rm_read_i32(ctx->task,
-                                     obj + OFF_USTRUCT_PROPS_SIZE, &ok);
+        bool ok = false;
+        c->struct_size = rm_read_i32(ctx->task, obj + OFF_USTRUCT_PROPS_SIZE, &ok);
+        if (!ok || c->struct_size == 0) {
+            c->struct_size = rm_read_i32(ctx->task, obj + OFF_USTRUCT_PROPS_SIZE_425, &ok);
+        }
         if (!ok) c->struct_size = 0;
 
         /* Property list (FProperty chain via ChildProperties) */

@@ -60,13 +60,23 @@
 #define UFIELD_SIZE              0x30
 
 /* ------------------------------------------------------------------ */
-/*  UStruct  (inherits UField)                                        */
-/*  Offsets depend on engine version; these target 4.25–4.27.         */
 /* ------------------------------------------------------------------ */
-#define OFF_USTRUCT_SUPER        0x40   /* UStruct*  SuperStruct      */
-#define OFF_USTRUCT_CHILDREN     0x48   /* UField*   Children         */
-#define OFF_USTRUCT_CHILD_PROPS  0x50   /* FField*   ChildProperties  */
-#define OFF_USTRUCT_PROPS_SIZE   0x58   /* int32     PropertiesSize   */
+/*  UStruct  (inherits UField)                                        */
+/*  Offsets for UE 4.18 (with 4.25+ fallback support)                 */
+/* ------------------------------------------------------------------ */
+#define OFF_USTRUCT_SUPER_418    0x30   /* UStruct*  SuperStruct (UE 4.18) */
+#define OFF_USTRUCT_CHILDREN_418 0x38   /* UField*   Children (UE 4.18)    */
+#define OFF_USTRUCT_PROPS_SIZE_418 0x40 /* int32     PropertiesSize (4.18) */
+
+#define OFF_USTRUCT_SUPER_425    0x40   /* UStruct*  SuperStruct (UE 4.25) */
+#define OFF_USTRUCT_CHILDREN_425 0x48   /* UField*   Children (UE 4.25)    */
+#define OFF_USTRUCT_CHILD_PROPS  0x50   /* FField*   ChildProperties (4.25+) */
+#define OFF_USTRUCT_PROPS_SIZE_425 0x58 /* int32     PropertiesSize (4.25) */
+
+/* Defaults pointing to 4.18 */
+#define OFF_USTRUCT_SUPER        OFF_USTRUCT_SUPER_418
+#define OFF_USTRUCT_CHILDREN     OFF_USTRUCT_CHILDREN_418
+#define OFF_USTRUCT_PROPS_SIZE   OFF_USTRUCT_PROPS_SIZE_418
 
 /* ------------------------------------------------------------------ */
 /*  UClass  (inherits UStruct)                                        */
@@ -78,10 +88,16 @@
 /* ------------------------------------------------------------------ */
 /*  UFunction  (inherits UStruct)                                     */
 /* ------------------------------------------------------------------ */
-#define OFF_UFUNC_FLAGS          0xB0   /* uint32  FunctionFlags      */
-#define OFF_UFUNC_NUM_PARMS      0xB4   /* uint8   NumParms           */
-#define OFF_UFUNC_PARMS_SIZE     0xB6   /* uint16  ParmsSize          */
-#define OFF_UFUNC_RET_OFFSET     0xB8   /* uint16  ReturnValueOffset  */
+#define OFF_UFUNC_FLAGS_418      0x88   /* uint32  FunctionFlags (UE 4.18) */
+#define OFF_UFUNC_PARMS_SIZE_418 0x8E   /* uint16  ParmsSize (UE 4.18)     */
+
+#define OFF_UFUNC_FLAGS_425      0xB0   /* uint32  FunctionFlags (UE 4.25) */
+#define OFF_UFUNC_PARMS_SIZE_425 0xB6   /* uint16  ParmsSize (UE 4.25)     */
+
+#define OFF_UFUNC_FLAGS          OFF_UFUNC_FLAGS_418
+#define OFF_UFUNC_NUM_PARMS      0x8C   /* uint8   NumParms           */
+#define OFF_UFUNC_PARMS_SIZE     OFF_UFUNC_PARMS_SIZE_418
+#define OFF_UFUNC_RET_OFFSET     0x90   /* uint16  ReturnValueOffset  */
 
 /* ------------------------------------------------------------------ */
 /*  FField  (base of property chain in UE 4.25+)                      */

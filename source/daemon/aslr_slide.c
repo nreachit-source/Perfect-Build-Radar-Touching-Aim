@@ -12,9 +12,11 @@
 #include "remote_memory.h"
 
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <mach-o/loader.h>
 #include <string.h>
+
+typedef uint64_t mach_vm_address_t;
+typedef uint64_t mach_vm_size_t;
 
 /* ── dyld task info ─────────────────────────────────────────────────── */
 
@@ -89,22 +91,14 @@ aslr_result_t aslr_get_slide(mach_port_t task)
         return kFailed;
 
     /* 3. Read infoArray pointer (uint64 at +0x08). */
-    uint64_t info_array_ptr = 0;
-    if (!rm_read_ptr(task,
-                     all_image_info_addr + DYLD_AII_OFF_INFO_ARRAY,
-                     &info_array_ptr))
-        return kFailed;
-
+    uint64_t info_array_ptr = rm_read_ptr(task,
+                                          all_image_info_addr + DYLD_AII_OFF_INFO_ARRAY);
     if (info_array_ptr == 0)
         return kFailed;
 
     /* 4. Read the first entry's imageLoadAddress (pointer at +0x00). */
-    uint64_t base_addr = 0;
-    if (!rm_read_ptr(task,
-                     info_array_ptr + DYLD_IMG_OFF_LOAD_ADDR,
-                     &base_addr))
-        return kFailed;
-
+    uint64_t base_addr = rm_read_ptr(task,
+                                     info_array_ptr + DYLD_IMG_OFF_LOAD_ADDR);
     if (base_addr == 0)
         return kFailed;
 

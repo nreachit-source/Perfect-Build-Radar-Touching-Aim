@@ -8,8 +8,18 @@
 #include "remote_memory.h"
 
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <string.h>
+
+typedef uint64_t mach_vm_address_t;
+typedef uint64_t mach_vm_size_t;
+
+extern kern_return_t mach_vm_read_overwrite(
+    vm_map_t target_task,
+    mach_vm_address_t address,
+    mach_vm_size_t size,
+    mach_vm_address_t data,
+    mach_vm_size_t *outsize
+);
 
 /* ---------------------------------------------------------------------------
  * rm_task_acquire — Obtain a task port for the given PID.
