@@ -42,7 +42,9 @@ struct ue4r_ctx {
     uint64_t    guobjectarray;     /* Runtime address of GUObjectArray               */
     uint64_t    gnamepool;         /* Runtime address of FNamePool (GNames)          */
     uint64_t    gname_chunk_table; /* Resolved chunk table base pointer              */
+    uint64_t    cached_chunks[32]; /* Cached chunk base pointers                     */
     uint64_t    uclass_class;      /* Address of the UClass whose name is "Class"    */
+    char        name_cache[65536][64]; /* Fast lookup name string cache              */
 };
 
 /* -----------------------------------------------------------------------
@@ -132,6 +134,16 @@ bool ue4r_resolve_name(ue4r_ctx_t *ctx, uint64_t fname_addr,
                                  fname_addr + OFF_FNAME_NUMBER, &ok);
     if (!ok) number = 0;
 
+    /* Fast name cache hit */
+    if ((uint32_t)comp_index < 65536 && ctx->name_cache[comp_index][0] != '\0') {
+        if (number > 0) {
+            snprintf(buf, max, "%s_%d", ctx->name_cache[comp_index], number - 1);
+        } else {
+            snprintf(buf, max, "%s", ctx->name_cache[comp_index]);
+        }
+        return true;
+    }
+
     char name_buf[1024] = {0};
     bool resolved = false;
 
@@ -139,43 +151,66 @@ bool ue4r_resolve_name(ue4r_ctx_t *ctx, uint64_t fname_addr,
     uint32_t chunk_idx = (uint32_t)comp_index / 16384;
     uint32_t offset_in_chunk = (uint32_t)comp_index % 16384;
 
-    uint64_t chunk_tables[6];
-    int n_tables = 0;
-    if (rm_validate_ptr(ctx->gname_chunk_table)) {
-        chunk_tables[n_tables++] = ctx->gname_chunk_table;
-    }
-    chunk_tables[n_tables++] = ctx->gnamepool;
-    chunk_tables[n_tables++] = rm_read_ptr(ctx->task, ctx->gnamepool);
-    chunk_tables[n_tables++] = rm_read_ptr(ctx->task, ctx->gnamepool + 8);
-
-    for (int t = 0; t < n_tables && !resolved; t++) {
-        uint64_t table = chunk_tables[t];
-        if (!rm_validate_ptr(table)) continue;
-
-        uint64_t chunk_ptr = rm_read_ptr(ctx->task, table + (uint64_t)chunk_idx * 8);
-        if (!rm_validate_ptr(chunk_ptr)) continue;
-
-        uint64_t entry_ptr = rm_read_ptr(ctx->task, chunk_ptr + (uint64_t)offset_in_chunk * 8);
-        if (!rm_validate_ptr(entry_ptr)) continue;
-
-        uint16_t flags = rm_read_u16(ctx->task, entry_ptr + 8, &ok);
-        bool is_wide = ok && ((flags & 1) != 0);
-        if (!is_wide) {
-            if (rm_read_string(ctx->task, entry_ptr + 0x0c, name_buf, sizeof(name_buf))) {
-                if (name_buf[0] != '\0') {
-                    resolved = true;
+    if (rm_validate_ptr(ctx->gname_chunk_table) && chunk_idx < 32) {
+        if (!ctx->cached_chunks[chunk_idx]) {
+            ctx->cached_chunks[chunk_idx] = rm_read_ptr(ctx->task, ctx->gname_chunk_table + (uint64_t)chunk_idx * 8);
+        }
+        uint64_t chunk_ptr = ctx->cached_chunks[chunk_idx];
+        if (rm_validate_ptr(chunk_ptr)) {
+            uint64_t entry_ptr = rm_read_ptr(ctx->task, chunk_ptr + (uint64_t)offset_in_chunk * 8);
+            if (rm_validate_ptr(entry_ptr)) {
+                uint16_t flags = rm_read_u16(ctx->task, entry_ptr + 8, &ok);
+                bool is_wide = ok && ((flags & 1) != 0);
+                if (!is_wide) {
+                    if (rm_read_string(ctx->task, entry_ptr + 0x0c, name_buf, sizeof(name_buf))) {
+                        if (name_buf[0] != '\0') resolved = true;
+                    }
+                } else {
+                    uint8_t wide_buf[512] = {0};
+                    if (rm_read(ctx->task, entry_ptr + 0x0c, wide_buf, sizeof(wide_buf))) {
+                        for (size_t i = 0; i < sizeof(name_buf) - 1 && i < 256; i++) {
+                            char c = (char)wide_buf[i * 2];
+                            if (c == '\0') break;
+                            name_buf[i] = c;
+                        }
+                        if (name_buf[0] != '\0') resolved = true;
+                    }
                 }
             }
-        } else {
-            uint8_t wide_buf[512] = {0};
-            if (rm_read(ctx->task, entry_ptr + 0x0c, wide_buf, sizeof(wide_buf))) {
-                for (size_t i = 0; i < sizeof(name_buf) - 1 && i < 256; i++) {
-                    char c = (char)wide_buf[i * 2];
-                    if (c == '\0') break;
-                    name_buf[i] = c;
+        }
+    }
+
+    if (!resolved) {
+        uint64_t chunk_tables[3];
+        chunk_tables[0] = ctx->gnamepool;
+        chunk_tables[1] = rm_read_ptr(ctx->task, ctx->gnamepool);
+        chunk_tables[2] = rm_read_ptr(ctx->task, ctx->gnamepool + 8);
+
+        for (int t = 0; t < 3 && !resolved; t++) {
+            uint64_t table = chunk_tables[t];
+            if (!rm_validate_ptr(table)) continue;
+
+            uint64_t chunk_ptr = rm_read_ptr(ctx->task, table + (uint64_t)chunk_idx * 8);
+            if (!rm_validate_ptr(chunk_ptr)) continue;
+
+            uint64_t entry_ptr = rm_read_ptr(ctx->task, chunk_ptr + (uint64_t)offset_in_chunk * 8);
+            if (!rm_validate_ptr(entry_ptr)) continue;
+
+            uint16_t flags = rm_read_u16(ctx->task, entry_ptr + 8, &ok);
+            bool is_wide = ok && ((flags & 1) != 0);
+            if (!is_wide) {
+                if (rm_read_string(ctx->task, entry_ptr + 0x0c, name_buf, sizeof(name_buf))) {
+                    if (name_buf[0] != '\0') resolved = true;
                 }
-                if (name_buf[0] != '\0') {
-                    resolved = true;
+            } else {
+                uint8_t wide_buf[512] = {0};
+                if (rm_read(ctx->task, entry_ptr + 0x0c, wide_buf, sizeof(wide_buf))) {
+                    for (size_t i = 0; i < sizeof(name_buf) - 1 && i < 256; i++) {
+                        char c = (char)wide_buf[i * 2];
+                        if (c == '\0') break;
+                        name_buf[i] = c;
+                    }
+                    if (name_buf[0] != '\0') resolved = true;
                 }
             }
         }
@@ -209,6 +244,11 @@ bool ue4r_resolve_name(ue4r_ctx_t *ctx, uint64_t fname_addr,
     }
 
     if (!resolved) return false;
+
+    /* Populate name cache */
+    if ((uint32_t)comp_index < 65536) {
+        strncpy(ctx->name_cache[comp_index], name_buf, sizeof(ctx->name_cache[comp_index]) - 1);
+    }
 
     if (number > 0) {
         char suffix[32];
