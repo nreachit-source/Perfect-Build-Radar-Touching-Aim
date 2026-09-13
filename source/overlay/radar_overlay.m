@@ -1,11 +1,11 @@
 /*
- * radar_overlay.m — SpringBoard tweak: live radar minimap & ESP overlay.
+ * radar_overlay.m — SpringBoard tweak: live radar HUD & snaplines.
  *
  * Reads shared memory written by ue4loadmonitor daemon and renders:
- *  - Floating touchless HUD with compact expandable menu
- *  - High-precision circular radar minimap (with FOV cone, enemy facing yaw, HP rings)
- *  - Screen laser snaplines to visible enemies
- *  - 100% touch pass-through (only floating menu button intercepts touches)
+ *  - 100% Touch Pass-Through (window is completely untouchable)
+ *  - Fullscreen laser snaplines to visible enemies
+ *  - High-precision circular radar minimap (with view cone, health rings, enemy dots)
+ *  - Dynamic orientation adaptation for Landscape and Portrait
  *
  * Compatible with Zig cross-compiler (-target aarch64-macos) using raw ObjC runtime.
  */
@@ -25,7 +25,7 @@
 #include "../daemon/radar_data.h"
 
 /* ------------------------------------------------------------------ */
-/*  ObjC Runtime Definitions (no SDK headers needed)                  */
+/*  ObjC Runtime Definitions (no Apple SDK headers needed)            */
 /* ------------------------------------------------------------------ */
 
 typedef void *id;
@@ -61,11 +61,6 @@ static inline CGRect CGRectMake_f(CGFloat x, CGFloat y, CGFloat w, CGFloat h) {
     return r;
 }
 
-static inline BOOL in_rect(CGPoint p, CGRect r) {
-    return p.x >= r.origin.x && p.y >= r.origin.y &&
-           p.x < (r.origin.x + r.size.width) && p.y < (r.origin.y + r.size.height);
-}
-
 /* CoreGraphics */
 typedef void *CGContextRef;
 extern CGContextRef UIGraphicsGetCurrentContext(void);
@@ -78,10 +73,9 @@ extern void CGContextMoveToPoint(CGContextRef c, CGFloat x, CGFloat y);
 extern void CGContextAddLineToPoint(CGContextRef c, CGFloat x, CGFloat y);
 extern void CGContextStrokePath(CGContextRef c);
 extern void CGContextFillPath(CGContextRef c);
+extern void CGContextClosePath(CGContextRef c);
 extern void CGContextAddArc(CGContextRef c, CGFloat x, CGFloat y, CGFloat radius,
                              CGFloat startAngle, CGFloat endAngle, int clockwise);
-extern void CGContextClosePath(CGContextRef c);
-extern void CGContextStrokeRect(CGContextRef c, CGRect rect);
 extern void CGContextFillRect(CGContextRef c, CGRect rect);
 extern void NSLog(id format, ...);
 
@@ -97,7 +91,6 @@ static id nsstr(const char *s) {
 /* ------------------------------------------------------------------ */
 
 #define RADAR_SIZE       180.0f
-#define RADAR_MARGIN     16.0f
 #define RADAR_RANGE      20000.0f  /* 200m in UE units */
 #define DOT_SIZE         6.0f
 #define RING_WIDTH       2.0f
@@ -115,44 +108,11 @@ static id g_window          = nil;
 static id g_radar_view      = nil;
 static id g_line_view       = nil;
 static id g_status_label    = nil;
-static id g_menu_button     = nil;
-static id g_radar_button    = nil;
-static id g_lines_button    = nil;
-static id g_range_button    = nil;
-
-static BOOL g_menu_open     = NO;
-static BOOL g_radar_on      = YES;
-static BOOL g_lines_on      = NO;
-static int  g_range_mode    = 1; /* 0=100m, 1=200m, 2=400m */
-
-static CGRect g_btn_menu_rect;
-static CGRect g_btn_radar_rect;
-static CGRect g_btn_lines_rect;
-static CGRect g_btn_range_rect;
-
-static void set_hidden(id view, BOOL val) {
-    if (view) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(view, sel_registerName("setHidden:"), val);
-    }
-}
-
-static void set_title(id button, const char *text) {
-    if (button) {
-        ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(
-            button, sel_registerName("setTitle:forState:"), nsstr(text), 0);
-    }
-}
 
 static double monotonic_seconds(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec / 1e9;
-}
-
-static float current_radar_range(void) {
-    if (g_range_mode == 0) return 10000.0f; /* 100m */
-    if (g_range_mode == 2) return 40000.0f; /* 400m */
-    return 20000.0f; /* 200m default */
 }
 
 /* ------------------------------------------------------------------ */
@@ -201,12 +161,11 @@ static BOOL read_snapshot(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Radar View Drawing                                                */
+/*  Radar Minimap Drawing                                             */
 /* ------------------------------------------------------------------ */
 
 static void radar_drawRect(id self, SEL _cmd, CGRect rect) {
     (void)self; (void)_cmd; (void)rect;
-    if (!g_radar_on) return;
 
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;
@@ -214,33 +173,32 @@ static void radar_drawRect(id self, SEL _cmd, CGRect rect) {
 
     float radius = RADAR_SIZE / 2.0f;
     float cx = radius, cy = radius;
-    float range = current_radar_range();
-    float scale = (radius - 10.0f) / range;
+    float scale = (radius - 8.0f) / RADAR_RANGE;
 
-    /* Background Circle: Frosted Dark Disc */
-    CGContextSetRGBFillColor(ctx, 0.04f, 0.07f, 0.12f, 0.75f);
+    /* Background Circle: Translucent Dark Disc */
+    CGContextSetRGBFillColor(ctx, 0.04f, 0.07f, 0.12f, 0.72f);
     CGContextFillEllipseInRect(ctx, CGRectMake_f(0, 0, RADAR_SIZE, RADAR_SIZE));
 
-    /* Outer Accent Ring (Glowing Cyan) */
+    /* Outer Neon Accent Ring */
     CGContextSetRGBStrokeColor(ctx, 0.0f, 0.85f, 1.0f, 0.65f);
     CGContextSetLineWidth(ctx, 1.5f);
     CGContextStrokeEllipseInRect(ctx, CGRectMake_f(1.0f, 1.0f, RADAR_SIZE - 2.0f, RADAR_SIZE - 2.0f));
 
     /* Concentric Range Rings (50%, 100%) */
-    CGContextSetRGBStrokeColor(ctx, 0.25f, 0.45f, 0.65f, 0.35f);
+    CGContextSetRGBStrokeColor(ctx, 0.3f, 0.5f, 0.7f, 0.35f);
     CGContextSetLineWidth(ctx, 0.75f);
-    float r1 = (radius - 10.0f) * 0.5f;
+    float r1 = (radius - 8.0f) * 0.5f;
     CGContextStrokeEllipseInRect(ctx, CGRectMake_f(cx - r1, cy - r1, r1 * 2, r1 * 2));
-    float r2 = radius - 10.0f;
+    float r2 = radius - 8.0f;
     CGContextStrokeEllipseInRect(ctx, CGRectMake_f(cx - r2, cy - r2, r2 * 2, r2 * 2));
 
     /* Crosshairs */
-    CGContextSetRGBStrokeColor(ctx, 0.25f, 0.45f, 0.65f, 0.25f);
+    CGContextSetRGBStrokeColor(ctx, 0.3f, 0.5f, 0.7f, 0.25f);
     CGContextSetLineWidth(ctx, 0.5f);
-    CGContextMoveToPoint(ctx, cx, 8.0f);
-    CGContextAddLineToPoint(ctx, cx, RADAR_SIZE - 8.0f);
-    CGContextMoveToPoint(ctx, 8.0f, cy);
-    CGContextAddLineToPoint(ctx, RADAR_SIZE - 8.0f, cy);
+    CGContextMoveToPoint(ctx, cx, 6.0f);
+    CGContextAddLineToPoint(ctx, cx, RADAR_SIZE - 6.0f);
+    CGContextMoveToPoint(ctx, 6.0f, cy);
+    CGContextAddLineToPoint(ctx, RADAR_SIZE - 6.0f, cy);
     CGContextStrokePath(ctx);
 
     /* View Yaw & Rotation */
@@ -249,18 +207,11 @@ static void radar_drawRect(id self, SEL _cmd, CGRect rect) {
     float cos_yaw = cosf(cam_yaw_rad);
     float sin_yaw = sinf(cam_yaw_rad);
 
-    /* Rotating Compass N Indicator */
-    float north_rad = cam_yaw * (float)M_PI / 180.0f;
-    float nx = cx + sinf(north_rad) * (radius - 6.0f);
-    float ny = cy - cosf(north_rad) * (radius - 6.0f);
-    CGContextSetRGBFillColor(ctx, 1.0f, 0.25f, 0.25f, 0.9f); /* Red N pip */
-    CGContextFillEllipseInRect(ctx, CGRectMake_f(nx - 2.5f, ny - 2.5f, 5.0f, 5.0f));
-
     /* View Cone (60° FOV Arc) */
     float fov = g_snapshot.header.camera_fov;
     if (!isfinite(fov) || fov < 10.0f || fov > 160.0f) fov = 80.0f;
     float cone_half = (fov * 0.5f) * (float)M_PI / 180.0f;
-    float cone_len = radius - 12.0f;
+    float cone_len = radius - 10.0f;
     float cl_x = cx + sinf(-cone_half) * cone_len;
     float cl_y = cy - cosf(-cone_half) * cone_len;
     float cr_x = cx + sinf(cone_half) * cone_len;
@@ -281,7 +232,7 @@ static void radar_drawRect(id self, SEL _cmd, CGRect rect) {
     CGContextAddLineToPoint(ctx, cr_x, cr_y);
     CGContextStrokePath(ctx);
 
-    /* Local Player Indicator: Center Cyan Chevron */
+    /* Local Player Indicator: Center Cyan Chevron (pointing UP) */
     CGContextSetRGBFillColor(ctx, 0.0f, 0.95f, 1.0f, 1.0f);
     CGContextMoveToPoint(ctx, cx, cy - 6.0f);
     CGContextAddLineToPoint(ctx, cx + 4.5f, cy + 4.5f);
@@ -305,77 +256,63 @@ static void radar_drawRect(id self, SEL _cmd, CGRect rect) {
         float dx = p->pos.x - lp.x;
         float dy = p->pos.y - lp.y;
 
-        /* Rotate relative to camera view */
+        /* Rotate relative to camera view:
+         * rx = Forward distance in UE
+         * ry = Right distance in UE
+         */
         float rx = dx * cos_yaw - dy * sin_yaw;
         float ry = dx * sin_yaw + dy * cos_yaw;
 
-        /* Screen projection (screen X is world Y, screen Y is -world X) */
+        /* Screen projection:
+         * Right is +X on screen (ry * scale)
+         * Forward is -Y / UP on screen (-rx * scale)
+         */
         float sx = ry * scale;
         float sy = -rx * scale;
 
         /* Clamp to radar circle */
-        float max_r = radius - DOT_SIZE - 3.0f;
+        float max_r = radius - DOT_SIZE - 2.0f;
         float dist = sqrtf(sx * sx + sy * sy);
-        BOOL is_clamped = NO;
         if (dist > max_r) {
             float c = max_r / dist;
             sx *= c;
             sy *= c;
-            is_clamped = YES;
         }
 
         float dotx = cx + sx;
         float doty = cy + sy;
 
-        /* Player Dot & Color */
+        /* Player Dot Color: Knocked = Orange, Alive = Red */
         if (p->health_status == 1) {
-            /* Knocked = Vibrant Orange */
             CGContextSetRGBFillColor(ctx, 1.0f, 0.65f, 0.0f, 1.0f);
         } else {
-            /* Alive = Vivid Red */
             CGContextSetRGBFillColor(ctx, 1.0f, 0.2f, 0.25f, 1.0f);
         }
 
-        if (is_clamped) {
-            /* Clamped pointer (small diamond/arrow) */
-            CGContextFillEllipseInRect(ctx, CGRectMake_f(dotx - 2.5f, doty - 2.5f, 5.0f, 5.0f));
-        } else {
-            /* Full Player Dot */
-            CGContextFillEllipseInRect(ctx, CGRectMake_f(dotx - DOT_SIZE * 0.5f,
-                                                         doty - DOT_SIZE * 0.5f,
-                                                         DOT_SIZE, DOT_SIZE));
+        /* Player Dot */
+        CGContextFillEllipseInRect(ctx, CGRectMake_f(dotx - DOT_SIZE * 0.5f,
+                                                     doty - DOT_SIZE * 0.5f,
+                                                     DOT_SIZE, DOT_SIZE));
 
-            /* Health Ring Arc around dot */
-            if (p->health_max > 0.0f) {
-                float hp_ratio = p->health / p->health_max;
-                if (hp_ratio > 1.0f) hp_ratio = 1.0f;
-                if (hp_ratio < 0.0f) hp_ratio = 0.0f;
+        /* Health Ring Arc around dot */
+        if (p->health_max > 0.0f) {
+            float hp_ratio = p->health / p->health_max;
+            if (hp_ratio > 1.0f) hp_ratio = 1.0f;
+            if (hp_ratio < 0.0f) hp_ratio = 0.0f;
 
-                /* Color based on health */
-                if (hp_ratio > 0.6f) {
-                    CGContextSetRGBStrokeColor(ctx, 0.2f, 0.95f, 0.3f, 0.85f); /* Green */
-                } else if (hp_ratio > 0.25f) {
-                    CGContextSetRGBStrokeColor(ctx, 1.0f, 0.75f, 0.1f, 0.85f); /* Yellow */
-                } else {
-                    CGContextSetRGBStrokeColor(ctx, 1.0f, 0.15f, 0.15f, 0.9f); /* Red */
-                }
-
-                CGContextSetLineWidth(ctx, RING_WIDTH);
-                float ring_r = DOT_SIZE * 0.5f + 2.0f;
-                CGFloat start = -(float)M_PI * 0.5f;
-                CGFloat end = start + hp_ratio * 2.0f * (float)M_PI;
-                CGContextAddArc(ctx, dotx, doty, ring_r, start, end, 0);
-                CGContextStrokePath(ctx);
+            if (hp_ratio > 0.5f) {
+                CGContextSetRGBStrokeColor(ctx, 0.2f, 0.95f, 0.3f, 0.85f); /* Green */
+            } else if (hp_ratio > 0.25f) {
+                CGContextSetRGBStrokeColor(ctx, 1.0f, 0.75f, 0.1f, 0.85f); /* Yellow */
+            } else {
+                CGContextSetRGBStrokeColor(ctx, 1.0f, 0.15f, 0.15f, 0.9f); /* Red */
             }
 
-            /* Enemy Facing Direction Pip */
-            float enemy_rel_yaw = (p->yaw - cam_yaw) * (float)M_PI / 180.0f;
-            float px = dotx + sinf(enemy_rel_yaw) * 7.0f;
-            float py = doty - cosf(enemy_rel_yaw) * 7.0f;
-            CGContextSetRGBStrokeColor(ctx, 1.0f, 1.0f, 1.0f, 0.75f);
-            CGContextSetLineWidth(ctx, 1.0f);
-            CGContextMoveToPoint(ctx, dotx, doty);
-            CGContextAddLineToPoint(ctx, px, py);
+            CGContextSetLineWidth(ctx, RING_WIDTH);
+            float ring_r = DOT_SIZE * 0.5f + 2.0f;
+            CGFloat start = -(float)M_PI * 0.5f;
+            CGFloat end = start + hp_ratio * 2.0f * (float)M_PI;
+            CGContextAddArc(ctx, dotx, doty, ring_r, start, end, 0);
             CGContextStrokePath(ctx);
         }
     }
@@ -387,7 +324,7 @@ static void radar_drawRect(id self, SEL _cmd, CGRect rect) {
 
 static void lines_draw(id self, SEL cmd, CGRect dirty) {
     (void)cmd; (void)dirty;
-    if (!g_lines_on || !g_snapshot.header.camera_valid || g_snapshot.header.status != 2 ||
+    if (!g_snapshot.header.camera_valid || g_snapshot.header.status != 2 ||
         monotonic_seconds() - g_changed_at > 2.0) return;
 
     CGContextRef ctx = UIGraphicsGetCurrentContext();
@@ -411,7 +348,7 @@ static void lines_draw(id self, SEL cmd, CGRect dirty) {
     if (!isfinite(fov) || fov <= 10.0 || fov >= 180.0) return;
     double focal = w / (2.0 * tan(fov * M_PI / 360.0));
 
-    CGContextSetLineWidth(ctx, 1.2f);
+    CGContextSetLineWidth(ctx, 1.5f);
 
     uint32_t count = g_snapshot.header.player_count;
     if (count > RADAR_MAX_PLAYERS) count = RADAR_MAX_PLAYERS;
@@ -433,126 +370,37 @@ static void lines_draw(id self, SEL cmd, CGRect dirty) {
         double x = w * 0.5 + (right * focal / depth);
         double y = h * 0.5 - (up * focal / depth);
 
-        if (!isfinite(x) || !isfinite(y) || x < -50.0 || x > w + 50.0 || y < -50.0 || y > h + 50.0) continue;
+        if (!isfinite(x) || !isfinite(y) || x < 0 || x > w || y < 0 || y > h) continue;
 
-        /* Snapline from bottom center of screen to enemy */
+        /* Snapline from bottom center of screen to enemy position */
         if (p->health_status == 1) {
-            CGContextSetRGBStrokeColor(ctx, 1.0f, 0.65f, 0.0f, 0.75f); /* Orange for knocked */
+            CGContextSetRGBStrokeColor(ctx, 1.0f, 0.65f, 0.0f, 0.85f); /* Orange for knocked */
         } else {
-            CGContextSetRGBStrokeColor(ctx, 0.0f, 0.9f, 1.0f, 0.75f);  /* Cyan for alive */
+            CGContextSetRGBStrokeColor(ctx, 0.0f, 0.9f, 1.0f, 0.85f);  /* Cyan for alive */
         }
 
         CGContextMoveToPoint(ctx, w * 0.5, h);
         CGContextAddLineToPoint(ctx, x, y);
         CGContextStrokePath(ctx);
 
-        /* Small box target at enemy location */
-        CGContextStrokeRect(ctx, CGRectMake_f(x - 4.0f, y - 4.0f, 8.0f, 8.0f));
+        /* Small target circle at projected enemy position */
+        CGContextSetRGBFillColor(ctx, 1.0f, 0.2f, 0.25f, 0.9f);
+        CGContextFillEllipseInRect(ctx, CGRectMake_f(x - 3.5f, y - 3.5f, 7.0f, 7.0f));
     }
 }
 
 /* ------------------------------------------------------------------ */
-/*  Touch Handling: 100% Pass-Through Except Floating Buttons         */
+/*  Touch Handling: 100% Pass-Through Unconditionally                 */
 /* ------------------------------------------------------------------ */
-
-static id window_hitTest(id self, SEL cmd, CGPoint point, id event) {
-    (void)cmd; (void)event;
-    /* 1. Check Menu Toggle Button */
-    if (g_menu_button && !((BOOL (*)(id, SEL))objc_msgSend)(g_menu_button, sel_registerName("isHidden"))) {
-        if (in_rect(point, g_btn_menu_rect)) return g_menu_button;
-    }
-    /* 2. Check Expanded Menu Buttons */
-    if (g_menu_open) {
-        if (g_radar_button && !((BOOL (*)(id, SEL))objc_msgSend)(g_radar_button, sel_registerName("isHidden"))) {
-            if (in_rect(point, g_btn_radar_rect)) return g_radar_button;
-        }
-        if (g_lines_button && !((BOOL (*)(id, SEL))objc_msgSend)(g_lines_button, sel_registerName("isHidden"))) {
-            if (in_rect(point, g_btn_lines_rect)) return g_lines_button;
-        }
-        if (g_range_button && !((BOOL (*)(id, SEL))objc_msgSend)(g_range_button, sel_registerName("isHidden"))) {
-            if (in_rect(point, g_btn_range_rect)) return g_range_button;
-        }
-    }
-    /* EVERYTHING ELSE IS UNTOUCHABLE -> 100% PASS-THROUGH TO GAME */
-    return nil;
-}
 
 static BOOL window_pointInside(id self, SEL cmd, CGPoint point, id event) {
-    return window_hitTest(self, cmd, point, event) != nil;
+    (void)self; (void)cmd; (void)point; (void)event;
+    /* 100% UNTOUCHABLE: Passes all touches directly to the underlying game/SpringBoard */
+    return NO;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Menu Button Actions                                               */
-/* ------------------------------------------------------------------ */
-
-static void update_menu_ui(void) {
-    set_hidden(g_radar_button, !g_menu_open);
-    set_hidden(g_lines_button, !g_menu_open);
-    set_hidden(g_range_button, !g_menu_open);
-
-    set_title(g_menu_button, g_menu_open ? "✕ Close" : "⚡ Radar");
-    set_title(g_radar_button, g_radar_on ? "Radar: ON" : "Radar: OFF");
-    set_title(g_lines_button, g_lines_on ? "Lines ESP: ON" : "Lines ESP: OFF");
-
-    const char *range_str = (g_range_mode == 0) ? "Range: 100m" :
-                            (g_range_mode == 2) ? "Range: 400m" : "Range: 200m";
-    set_title(g_range_button, range_str);
-}
-
-static void menu_action(id self, SEL cmd, id sender) {
-    (void)self; (void)cmd;
-    if (sender == g_menu_button) {
-        g_menu_open = !g_menu_open;
-    } else if (sender == g_radar_button) {
-        g_radar_on = !g_radar_on;
-    } else if (sender == g_lines_button) {
-        g_lines_on = !g_lines_on;
-    } else if (sender == g_range_button) {
-        g_range_mode = (g_range_mode + 1) % 3;
-    }
-    update_menu_ui();
-}
-
-/* Helper to construct stylized buttons */
-static id make_button(id target, CGRect frame, const char *text) {
-    id button = ((id (*)(id, SEL, NSInteger))objc_msgSend)(
-        (id)objc_getClass("UIButton"), sel_registerName("buttonWithType:"), 1);
-    ((void (*)(id, SEL, CGRect))objc_msgSend)(button, sel_registerName("setFrame:"), frame);
-
-    id color = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-        (id)objc_getClass("UIColor"), sel_registerName("colorWithRed:green:blue:alpha:"),
-        0.06, 0.10, 0.18, 0.88);
-    ((void (*)(id, SEL, id))objc_msgSend)(button, sel_registerName("setBackgroundColor:"), color);
-
-    /* Rounded pill border */
-    id layer = ((id (*)(id, SEL))objc_msgSend)(button, sel_registerName("layer"));
-    if (layer) {
-        ((void (*)(id, SEL, CGFloat))objc_msgSend)(layer, sel_registerName("setCornerRadius:"), 8.0);
-        ((void (*)(id, SEL, CGFloat))objc_msgSend)(layer, sel_registerName("setBorderWidth:"), 1.0);
-        id border_color = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-            (id)objc_getClass("UIColor"), sel_registerName("colorWithRed:green:blue:alpha:"),
-            0.0, 0.75, 1.0, 0.45);
-        id cg_color = ((id (*)(id, SEL))objc_msgSend)(border_color, sel_registerName("CGColor"));
-        ((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setBorderColor:"), cg_color);
-    }
-
-    set_title(button, text);
-    ((void (*)(id, SEL, id, SEL, NSUInteger))objc_msgSend)(
-        button, sel_registerName("addTarget:action:forControlEvents:"), target, sel_registerName("menuAction:"), 64);
-
-    id title_label = ((id (*)(id, SEL))objc_msgSend)(button, sel_registerName("titleLabel"));
-    if (title_label) {
-        id font = ((id (*)(id, SEL, double))objc_msgSend)(
-            (id)objc_getClass("UIFont"), sel_registerName("boldSystemFontOfSize:"), 12.0);
-        ((void (*)(id, SEL, id))objc_msgSend)(title_label, sel_registerName("setFont:"), font);
-    }
-
-    ((void (*)(id, SEL, id))objc_msgSend)(g_window, sel_registerName("addSubview:"), button);
-    return button;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Timer Refresh (CADisplayLink / NSTimer at ~30 FPS)                */
+/*  Timer Refresh (at ~30 FPS)                                        */
 /* ------------------------------------------------------------------ */
 
 static int g_frame_counter = 0;
@@ -576,48 +424,45 @@ static void timer_tick(id self, SEL _cmd, id timer) {
         }
     }
 
-    /* Update dynamic layout */
-    CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("bounds"));
+    /* Dynamic orientation layout adaptation */
+    id mainScreen = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIScreen"), sel_registerName("mainScreen"));
+    CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, sel_registerName("bounds"));
     if (bounds.size.width > 0 && bounds.size.height > 0) {
-        double rx = fmax(8.0, bounds.size.width - RADAR_SIZE - RADAR_MARGIN);
-        double ry = 48.0;
+        double w = bounds.size.width;
+        double h = bounds.size.height;
 
-        /* Layout Frames */
-        g_btn_menu_rect  = CGRectMake_f(rx, 8.0, RADAR_SIZE, 32.0);
-        g_btn_radar_rect = CGRectMake_f(rx, 44.0, RADAR_SIZE, 34.0);
-        g_btn_lines_rect = CGRectMake_f(rx, 80.0, RADAR_SIZE, 34.0);
-        g_btn_range_rect = CGRectMake_f(rx, 116.0, RADAR_SIZE, 34.0);
+        /* Adapt radar position for Landscape vs Portrait */
+        double rx = w - RADAR_SIZE - 20.0;
+        double ry = (w > h) ? 16.0 : 48.0;
 
-        ((void (*)(id, SEL, CGRect))objc_msgSend)(g_menu_button, sel_registerName("setFrame:"), g_btn_menu_rect);
-        ((void (*)(id, SEL, CGRect))objc_msgSend)(g_radar_button, sel_registerName("setFrame:"), g_btn_radar_rect);
-        ((void (*)(id, SEL, CGRect))objc_msgSend)(g_lines_button, sel_registerName("setFrame:"), g_btn_lines_rect);
-        ((void (*)(id, SEL, CGRect))objc_msgSend)(g_range_button, sel_registerName("setFrame:"), g_btn_range_rect);
+        if (g_line_view) {
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(g_line_view, sel_registerName("setFrame:"), CGRectMake_f(0, 0, w, h));
+            ((void (*)(id, SEL))objc_msgSend)(g_line_view, sel_registerName("setNeedsDisplay"));
+        }
 
-        double radar_top = g_menu_open ? 154.0 : ry;
-        ((void (*)(id, SEL, CGRect))objc_msgSend)(g_radar_view, sel_registerName("setFrame:"),
-            CGRectMake_f(rx, radar_top, RADAR_SIZE, RADAR_SIZE));
-        ((void (*)(id, SEL, CGRect))objc_msgSend)(g_status_label, sel_registerName("setFrame:"),
-            CGRectMake_f(rx, radar_top + RADAR_SIZE + 2.0, RADAR_SIZE, 22.0));
+        if (g_radar_view) {
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(g_radar_view, sel_registerName("setFrame:"), CGRectMake_f(rx, ry, RADAR_SIZE, RADAR_SIZE));
+            ((void (*)(id, SEL))objc_msgSend)(g_radar_view, sel_registerName("setNeedsDisplay"));
+        }
 
-        ((void (*)(id, SEL, CGRect))objc_msgSend)(g_line_view, sel_registerName("setFrame:"), bounds);
+        if (g_status_label) {
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(g_status_label, sel_registerName("setFrame:"),
+                CGRectMake_f(rx, ry + RADAR_SIZE + 2.0, RADAR_SIZE, 20.0));
+        }
     }
 
-    /* Redraw views */
-    if (g_radar_view) ((void (*)(id, SEL))objc_msgSend)(g_radar_view, sel_registerName("setNeedsDisplay"));
-    if (g_line_view)  ((void (*)(id, SEL))objc_msgSend)(g_line_view, sel_registerName("setNeedsDisplay"));
-
-    /* Update Status Badge (every 10 frames) */
+    /* Update Status Badge */
     if (g_frame_counter % 10 == 1 && g_status_label) {
         BOOL fresh = (monotonic_seconds() - g_changed_at < 2.0);
         char label[96];
         if (!fresh) {
-            snprintf(label, sizeof(label), "○ Offline");
+            snprintf(label, sizeof(label), "Radar | Standby");
         } else if (g_snapshot.header.status == 2) {
-            snprintf(label, sizeof(label), "● Live  |  %u Enemies", g_snapshot.header.player_count);
+            snprintf(label, sizeof(label), "Radar | Live | %u", g_snapshot.header.player_count);
         } else if (g_snapshot.header.status == 3) {
-            snprintf(label, sizeof(label), "◌ In Lobby...");
+            snprintf(label, sizeof(label), "Radar | In Lobby");
         } else {
-            snprintf(label, sizeof(label), "◌ Connecting...");
+            snprintf(label, sizeof(label), "Radar | Connecting...");
         }
         ((void (*)(id, SEL, id))objc_msgSend)(g_status_label, sel_registerName("setText:"), nsstr(label));
     }
@@ -644,8 +489,6 @@ static void init_overlay(void) {
     if (!RadarWindow) {
         RadarWindow = objc_getClass("AntigravityRadarWindow");
     } else {
-        class_addMethod(RadarWindow, sel_registerName("hitTest:withEvent:"),
-                        (IMP)window_hitTest, "@@:{CGPoint=dd}@");
         class_addMethod(RadarWindow, sel_registerName("pointInside:withEvent:"),
                         (IMP)window_pointInside, "B@:{CGPoint=dd}@");
         objc_registerClassPair(RadarWindow);
@@ -679,7 +522,7 @@ static void init_overlay(void) {
         sel_registerName("initWithFrame:"), bounds);
     g_window = window;
 
-    /* Window Properties */
+    /* Window Properties: Level 10000001, Clear, Touch Pass-Through */
     ((void (*)(id, SEL, double))objc_msgSend)(window, sel_registerName("setWindowLevel:"), 10000001.0);
 
     id clearColor = ((id (*)(id, SEL))objc_msgSend)((id)UIColor_cls, sel_registerName("clearColor"));
@@ -710,10 +553,10 @@ static void init_overlay(void) {
     g_line_view = lineView;
     ((void (*)(id, SEL, id))objc_msgSend)(window, sel_registerName("addSubview:"), lineView);
 
-    double rx = fmax(8.0, bounds.size.width - RADAR_SIZE - RADAR_MARGIN);
+    double rx = bounds.size.width - RADAR_SIZE - 20.0;
     id radarView = ((id (*)(id, SEL, CGRect))objc_msgSend)(
         ((id (*)(id, SEL))objc_msgSend)((id)RadarView, sel_registerName("alloc")),
-        sel_registerName("initWithFrame:"), CGRectMake_f(rx, 48.0, RADAR_SIZE, RADAR_SIZE));
+        sel_registerName("initWithFrame:"), CGRectMake_f(rx, 20.0, RADAR_SIZE, RADAR_SIZE));
     ((void (*)(id, SEL, id))objc_msgSend)(radarView, sel_registerName("setBackgroundColor:"), clearColor);
     ((void (*)(id, SEL, BOOL))objc_msgSend)(radarView, sel_registerName("setOpaque:"), NO);
     ((void (*)(id, SEL, BOOL))objc_msgSend)(radarView, sel_registerName("setUserInteractionEnabled:"), NO);
@@ -723,44 +566,29 @@ static void init_overlay(void) {
     /* Status Label */
     id statusLabel = ((id (*)(id, SEL, CGRect))objc_msgSend)(
         ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UILabel"), sel_registerName("alloc")),
-        sel_registerName("initWithFrame:"), CGRectMake_f(rx, 48.0 + RADAR_SIZE + 2.0, RADAR_SIZE, 22.0));
+        sel_registerName("initWithFrame:"), CGRectMake_f(rx, 20.0 + RADAR_SIZE + 2.0, RADAR_SIZE, 20.0));
     id whiteColor = ((id (*)(id, SEL))objc_msgSend)((id)UIColor_cls, sel_registerName("whiteColor"));
     ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, sel_registerName("setTextColor:"), whiteColor);
-    id font = ((id (*)(id, SEL, double))objc_msgSend)((id)objc_getClass("UIFont"), sel_registerName("systemFontOfSize:"), 11.0);
+    id font = ((id (*)(id, SEL, double))objc_msgSend)((id)objc_getClass("UIFont"), sel_registerName("boldSystemFontOfSize:"), 12.0);
     ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, sel_registerName("setFont:"), font);
     ((void (*)(id, SEL, NSInteger))objc_msgSend)(statusLabel, sel_registerName("setTextAlignment:"), 1); /* NSTextAlignmentCenter */
     ((void (*)(id, SEL, BOOL))objc_msgSend)(statusLabel, sel_registerName("setUserInteractionEnabled:"), NO);
     g_status_label = statusLabel;
     ((void (*)(id, SEL, id))objc_msgSend)(window, sel_registerName("addSubview:"), statusLabel);
 
-    /* 6. Buttons & Menu Controller Helper */
-    Class MenuHelper = objc_allocateClassPair(objc_getClass("NSObject"), "AntigravityRadarMenuHelper", 0);
-    if (!MenuHelper) {
-        MenuHelper = objc_getClass("AntigravityRadarMenuHelper");
-    } else {
-        class_addMethod(MenuHelper, sel_registerName("menuAction:"), (IMP)menu_action, "v@:@");
-        class_addMethod(MenuHelper, sel_registerName("tick:"), (IMP)timer_tick, "v@:@");
-        objc_registerClassPair(MenuHelper);
-    }
-    id helper = ((id (*)(id, SEL))objc_msgSend)(
-        ((id (*)(id, SEL))objc_msgSend)((id)MenuHelper, sel_registerName("alloc")), sel_registerName("init"));
-
-    g_btn_menu_rect  = CGRectMake_f(rx, 8.0, RADAR_SIZE, 32.0);
-    g_btn_radar_rect = CGRectMake_f(rx, 44.0, RADAR_SIZE, 34.0);
-    g_btn_lines_rect = CGRectMake_f(rx, 80.0, RADAR_SIZE, 34.0);
-    g_btn_range_rect = CGRectMake_f(rx, 116.0, RADAR_SIZE, 34.0);
-
-    g_menu_button  = make_button(helper, g_btn_menu_rect, "⚡ Radar");
-    g_radar_button = make_button(helper, g_btn_radar_rect, "Radar: ON");
-    g_lines_button = make_button(helper, g_btn_lines_rect, "Lines ESP: OFF");
-    g_range_button = make_button(helper, g_btn_range_rect, "Range: 200m");
-
-    set_hidden(g_radar_button, YES);
-    set_hidden(g_lines_button, YES);
-    set_hidden(g_range_button, YES);
-
     ((void (*)(id, SEL, BOOL))objc_msgSend)(window, sel_registerName("setHidden:"), NO);
     ((void (*)(id, SEL))objc_msgSend)(window, sel_registerName("makeKeyAndVisible"));
+
+    /* 6. Helper for Refresh Timer */
+    Class HelperClass = objc_allocateClassPair(objc_getClass("NSObject"), "AntigravityRadarTimerHelper", 0);
+    if (!HelperClass) {
+        HelperClass = objc_getClass("AntigravityRadarTimerHelper");
+    } else {
+        class_addMethod(HelperClass, sel_registerName("tick:"), (IMP)timer_tick, "v@:@");
+        objc_registerClassPair(HelperClass);
+    }
+    id helper = ((id (*)(id, SEL))objc_msgSend)(
+        ((id (*)(id, SEL))objc_msgSend)((id)HelperClass, sel_registerName("alloc")), sel_registerName("init"));
 
     /* 7. Start Refresh Timer at 30 FPS */
     typedef id (*timer_fn)(id, SEL, double, id, SEL, id, BOOL);
@@ -774,7 +602,7 @@ static void init_overlay(void) {
     ((void (*)(id, SEL, id, id))objc_msgSend)(runloop, sel_registerName("addTimer:forMode:"), timer, mode);
 
     open_shared_memory();
-    NSLog(nsstr("%@"), nsstr("[Radar] Overlay initialized with touch pass-through"));
+    NSLog(nsstr("%@"), nsstr("[Radar] Overlay initialized with 100% touch pass-through"));
 }
 
 /* ------------------------------------------------------------------ */

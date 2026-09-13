@@ -1,15 +1,15 @@
 Package: com.local.ue4loadmonitor
 Name: UE4 Load Monitor
-Version: 1.3.1
+Version: 1.3.2
 Architecture: iphoneos-arm64
 Description: UE4 process detector, SDK exporter, and live radar overlay.
 Maintainer: Local Development
 Author: Local Development
 Section: Development
 Depends: firmware (>= 13.0)
-Filename: debs/com.local.ue4loadmonitor_1.3.1_iphoneos-arm64.deb
-Size: 29366
-MD5sum: c803394f2be5657c1b41adf065ccbe4c
-SHA1: 8fd2c20f999739198a108e984a99dceea796af88
-SHA256: c6638ca52830f3b4249adb2cc0d1088e8382d2669bc9ca49e95143a64f9ff92c
+Filename: debs/com.local.ue4loadmonitor_1.3.2_iphoneos-arm64.deb
+Size: 26550
+MD5sum: ac2e0d008c518ba111d62490d30080cd
+SHA1: 2eef779f184ca503c698f1904e8a3c27c0e72a5f
+SHA256: e33e197e9ced4f7e1d288c60a9182c43537da291117c141bb2af4223de1ad32b
 
