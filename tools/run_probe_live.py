@@ -32,6 +32,9 @@ print("Pushing probe_live to device...")
 subprocess.run([str(PY3), "-m", "pymobiledevice3", "afc", "push",
                 str(out_bin), "/probe_live"], check=True)
 
+subprocess.run([str(PY3), "-m", "pymobiledevice3", "afc", "push",
+                str(ROOT / "source/daemon/entitlements.plist"), "/daemon_entitlements.plist"], check=True)
+
 script = """
 cp /var/mobile/Media/probe_live /var/jb/tmp/probe_live
 chmod 755 /var/jb/tmp/probe_live

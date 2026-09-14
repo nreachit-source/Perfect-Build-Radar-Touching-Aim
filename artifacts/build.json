@@ -1,9 +1,9 @@
 {
-  "version": "1.3.3",
-  "build": "server-passthrough-20260913",
+  "version": "1.3.4",
+  "build": "server-passthrough-20260914",
   "sha256": {
-    "ue4loadmonitor": "cccb6d8c20d2be74160736a7e7541207a6967eed184f05e5a24e21cbabf20cf8",
-    "radar_overlay.dylib": "4914801f57ccd35ef1186a230ecf7d514865d4965357a81d8834286270c460f4"
+    "ue4loadmonitor": "d00e5e7da333383e2a510b0790807dd4d7ae0ba8f1bef1a6b752d61bcf23a7f9",
+    "radar_overlay.dylib": "ecf2268a08e43dc339be2dd8e1dea48ef3847c0fa6102f3065515237708bc601"
   },
   "source": "source/overlay/radar_overlay.m",
   "note": "Signed binaries retrieved from the phone; Mach-O sections match build_codex."

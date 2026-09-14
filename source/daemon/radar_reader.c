@@ -61,6 +61,7 @@ static unsigned vehicle_count;
 static uint64_t items[256];
 static unsigned item_count;
 static double   next_scan_time;
+static uint32_t s_cached_local_team = 0;
 
 static double now_seconds(void) {
     struct timespec ts;
@@ -137,6 +138,18 @@ static void resolve_item_info(int32_t item_id, char *name, size_t max_len, uint8
         case 101008: snprintf(name, max_len, "M762"); *category = 1; return;
         case 101009: snprintf(name, max_len, "Mk47"); *category = 1; return;
         case 101010: snprintf(name, max_len, "G36C"); *category = 1; return;
+        case 101011: snprintf(name, max_len, "FAMAS"); *category = 1; return;
+        case 101012: snprintf(name, max_len, "ACE32"); *category = 1; return;
+        case 101013: snprintf(name, max_len, "HoneyBadger"); *category = 1; return;
+
+        /* SMGs */
+        case 102001: snprintf(name, max_len, "UMP45"); *category = 1; return;
+        case 102002: snprintf(name, max_len, "Micro Uzi"); *category = 1; return;
+        case 102003: snprintf(name, max_len, "Vector"); *category = 1; return;
+        case 102004: snprintf(name, max_len, "Tommy Gun"); *category = 1; return;
+        case 102005: snprintf(name, max_len, "PP-19 Bizon"); *category = 1; return;
+        case 102007: snprintf(name, max_len, "P90"); *category = 1; return;
+
         /* Sniper & DMR */
         case 103001: snprintf(name, max_len, "Kar98k"); *category = 1; return;
         case 103002: snprintf(name, max_len, "M24"); *category = 1; return;
@@ -148,6 +161,19 @@ static void resolve_item_info(int32_t item_id, char *name, size_t max_len, uint8
         case 103008: snprintf(name, max_len, "Win94"); *category = 1; return;
         case 103009: snprintf(name, max_len, "SLR"); *category = 1; return;
         case 103010: snprintf(name, max_len, "QBU"); *category = 1; return;
+        case 103011: snprintf(name, max_len, "Mosin"); *category = 1; return;
+        case 103012: snprintf(name, max_len, "AMR"); *category = 1; return;
+        case 103013: snprintf(name, max_len, "Mk12"); *category = 1; return;
+
+        /* Shotguns & LMGs */
+        case 104001: snprintf(name, max_len, "S686"); *category = 1; return;
+        case 104002: snprintf(name, max_len, "S1897"); *category = 1; return;
+        case 104003: snprintf(name, max_len, "S12K"); *category = 1; return;
+        case 104004: snprintf(name, max_len, "DBS"); *category = 1; return;
+        case 105001: snprintf(name, max_len, "M249"); *category = 1; return;
+        case 105002: snprintf(name, max_len, "DP-28"); *category = 1; return;
+        case 105010: snprintf(name, max_len, "MG3"); *category = 1; return;
+
         /* Armor & Helmets & Backpacks */
         case 501001: snprintf(name, max_len, "Helmet L1"); *category = 2; return;
         case 501002: snprintf(name, max_len, "Helmet L2"); *category = 2; return;
@@ -158,18 +184,30 @@ static void resolve_item_info(int32_t item_id, char *name, size_t max_len, uint8
         case 503001: snprintf(name, max_len, "Bag L1"); *category = 2; return;
         case 503002: snprintf(name, max_len, "Bag L2"); *category = 2; return;
         case 503003: snprintf(name, max_len, "Bag L3"); *category = 2; return;
+
         /* Meds */
         case 601001: snprintf(name, max_len, "Bandage"); *category = 3; return;
         case 601002: snprintf(name, max_len, "FirstAid"); *category = 3; return;
         case 601003: snprintf(name, max_len, "MedKit"); *category = 3; return;
-        case 601004: snprintf(name, max_len, "Drink"); *category = 3; return;
+        case 601004: snprintf(name, max_len, "EnergyDrink"); *category = 3; return;
         case 601005: snprintf(name, max_len, "Painkiller"); *category = 3; return;
         case 601006: snprintf(name, max_len, "Adrenaline"); *category = 3; return;
-        /* Scopes & Ammo */
+
+        /* Throwables / Grenades / Special */
+        case 602001: snprintf(name, max_len, "Frag Grenade"); *category = 5; return;
+        case 602002: snprintf(name, max_len, "Smoke"); *category = 5; return;
+        case 602003: snprintf(name, max_len, "Molotov"); *category = 5; return;
+        case 602004: snprintf(name, max_len, "Stun Grenade"); *category = 5; return;
+        case 603001: snprintf(name, max_len, "Flare Gun"); *category = 5; return;
+        case 504001: snprintf(name, max_len, "Air Drop"); *category = 5; return;
+        case 504002: snprintf(name, max_len, "Player Crate"); *category = 5; return;
+
+        /* Scopes & Ammo & Attachments */
         case 203001: snprintf(name, max_len, "RedDot"); *category = 4; return;
         case 203002: snprintf(name, max_len, "Holo"); *category = 4; return;
         case 203003: snprintf(name, max_len, "2x Scope"); *category = 4; return;
         case 203004: snprintf(name, max_len, "4x Scope"); *category = 4; return;
+        case 203005: snprintf(name, max_len, "3x Scope"); *category = 4; return;
         case 203014: snprintf(name, max_len, "6x Scope"); *category = 4; return;
         case 203015: snprintf(name, max_len, "8x Scope"); *category = 4; return;
         case 301001: snprintf(name, max_len, "5.56 Ammo"); *category = 4; return;
@@ -177,17 +215,128 @@ static void resolve_item_info(int32_t item_id, char *name, size_t max_len, uint8
         case 303001: snprintf(name, max_len, ".300 Mag"); *category = 4; return;
         case 304001: snprintf(name, max_len, "9mm Ammo"); *category = 4; return;
         case 305001: snprintf(name, max_len, ".45 Ammo"); *category = 4; return;
-        default:
-            if (item_id > 0) snprintf(name, max_len, "Item %d", item_id);
-            else snprintf(name, max_len, "Loot");
-            *category = 5;
-            return;
+        case 201009: snprintf(name, max_len, "AR Suppressor"); *category = 4; return;
+        case 201010: snprintf(name, max_len, "SR Suppressor"); *category = 4; return;
+        case 201011: snprintf(name, max_len, "AR Compensator"); *category = 4; return;
+        case 201012: snprintf(name, max_len, "SR Compensator"); *category = 4; return;
+        case 204009: snprintf(name, max_len, "AR Ext.QuickMag"); *category = 4; return;
+        case 204010: snprintf(name, max_len, "SR Ext.QuickMag"); *category = 4; return;
+
+        default: {
+            int prefix = item_id / 1000;
+            switch (prefix) {
+                case 101: snprintf(name, max_len, "Assault Rifle"); *category = 1; return;
+                case 102: snprintf(name, max_len, "SMG");           *category = 1; return;
+                case 103: snprintf(name, max_len, "Sniper");        *category = 1; return;
+                case 104: snprintf(name, max_len, "Shotgun");       *category = 1; return;
+                case 105: snprintf(name, max_len, "LMG");           *category = 1; return;
+                case 106: snprintf(name, max_len, "Pistol");        *category = 1; return;
+                case 107: case 108: snprintf(name, max_len, "Special Weapon"); *category = 1; return;
+                case 201: snprintf(name, max_len, "Muzzle");        *category = 4; return;
+                case 202: snprintf(name, max_len, "Grip");          *category = 4; return;
+                case 203: snprintf(name, max_len, "Scope");         *category = 4; return;
+                case 204: snprintf(name, max_len, "Magazine");      *category = 4; return;
+                case 205: snprintf(name, max_len, "Stock");         *category = 4; return;
+                case 301: snprintf(name, max_len, "5.56 Ammo");     *category = 4; return;
+                case 302: snprintf(name, max_len, "7.62 Ammo");     *category = 4; return;
+                case 303: snprintf(name, max_len, ".300 Mag");      *category = 4; return;
+                case 304: snprintf(name, max_len, "9mm Ammo");      *category = 4; return;
+                case 305: snprintf(name, max_len, ".45 Ammo");      *category = 4; return;
+                case 306: snprintf(name, max_len, "12 Gauge");      *category = 4; return;
+                case 307: snprintf(name, max_len, "Bolt / Arrow");  *category = 4; return;
+                case 501: snprintf(name, max_len, "Helmet");        *category = 2; return;
+                case 502: snprintf(name, max_len, "Armor Vest");    *category = 2; return;
+                case 503: snprintf(name, max_len, "Backpack");      *category = 2; return;
+                case 504: snprintf(name, max_len, "Player Crate");  *category = 5; return;
+                case 601: snprintf(name, max_len, "Medicine");      *category = 3; return;
+                case 602: snprintf(name, max_len, "Throwable");     *category = 5; return;
+                case 603: snprintf(name, max_len, "Flare Gun");     *category = 5; return;
+                case 605: snprintf(name, max_len, "Shop Token");    *category = 5; return;
+                default:
+                    snprintf(name, max_len, "Loot Crate");
+                    *category = 5;
+                    return;
+            }
+        }
+    }
+}
+
+static void resolve_item_from_actor_name(const char *aname, char *name, size_t max_len, uint8_t *category) {
+    if (!aname || !aname[0]) return;
+    if (strstr(aname, "Smoke")) { snprintf(name, max_len, "Smoke"); *category = 5; return; }
+    if (strstr(aname, "Grenade") || strstr(aname, "Frag")) { snprintf(name, max_len, "Frag Grenade"); *category = 5; return; }
+    if (strstr(aname, "Burn") || strstr(aname, "Molotov")) { snprintf(name, max_len, "Molotov"); *category = 5; return; }
+    if (strstr(aname, "Flash") || strstr(aname, "Stun")) { snprintf(name, max_len, "Stun Grenade"); *category = 5; return; }
+    if (strstr(aname, "Flare")) { snprintf(name, max_len, "Flare Gun"); *category = 5; return; }
+    if (strstr(aname, "M416")) { snprintf(name, max_len, "M416"); *category = 1; return; }
+    if (strstr(aname, "AKM")) { snprintf(name, max_len, "AKM"); *category = 1; return; }
+    if (strstr(aname, "AWM")) { snprintf(name, max_len, "AWM"); *category = 1; return; }
+    if (strstr(aname, "M24")) { snprintf(name, max_len, "M24"); *category = 1; return; }
+    if (strstr(aname, "Kar98")) { snprintf(name, max_len, "Kar98k"); *category = 1; return; }
+    if (strstr(aname, "Groza")) { snprintf(name, max_len, "Groza"); *category = 1; return; }
+    if (strstr(aname, "AUG")) { snprintf(name, max_len, "AUG"); *category = 1; return; }
+    if (strstr(aname, "SCAR")) { snprintf(name, max_len, "SCAR-L"); *category = 1; return; }
+    if (strstr(aname, "M762")) { snprintf(name, max_len, "M762"); *category = 1; return; }
+    if (strstr(aname, "Mk14")) { snprintf(name, max_len, "Mk14"); *category = 1; return; }
+    if (strstr(aname, "Mini14")) { snprintf(name, max_len, "Mini14"); *category = 1; return; }
+    if (strstr(aname, "SKS")) { snprintf(name, max_len, "SKS"); *category = 1; return; }
+    if (strstr(aname, "SLR")) { snprintf(name, max_len, "SLR"); *category = 1; return; }
+    if (strstr(aname, "VSS")) { snprintf(name, max_len, "VSS"); *category = 1; return; }
+    if (strstr(aname, "UMP")) { snprintf(name, max_len, "UMP45"); *category = 1; return; }
+    if (strstr(aname, "Vector")) { snprintf(name, max_len, "Vector"); *category = 1; return; }
+    if (strstr(aname, "Uzi")) { snprintf(name, max_len, "Micro Uzi"); *category = 1; return; }
+    if (strstr(aname, "Tommy")) { snprintf(name, max_len, "Tommy Gun"); *category = 1; return; }
+    if (strstr(aname, "Bizon")) { snprintf(name, max_len, "PP-19 Bizon"); *category = 1; return; }
+    if (strstr(aname, "P90")) { snprintf(name, max_len, "P90"); *category = 1; return; }
+    if (strstr(aname, "DBS")) { snprintf(name, max_len, "DBS"); *category = 1; return; }
+    if (strstr(aname, "S12K")) { snprintf(name, max_len, "S12K"); *category = 1; return; }
+    if (strstr(aname, "S686")) { snprintf(name, max_len, "S686"); *category = 1; return; }
+    if (strstr(aname, "S1897")) { snprintf(name, max_len, "S1897"); *category = 1; return; }
+    if (strstr(aname, "DP28") || strstr(aname, "DP-28")) { snprintf(name, max_len, "DP-28"); *category = 1; return; }
+    if (strstr(aname, "M249")) { snprintf(name, max_len, "M249"); *category = 1; return; }
+    if (strstr(aname, "MG3")) { snprintf(name, max_len, "MG3"); *category = 1; return; }
+    if (strstr(aname, "Helmet_3") || strstr(aname, "Helmet_Lv3")) { snprintf(name, max_len, "Helmet L3"); *category = 2; return; }
+    if (strstr(aname, "Helmet_2") || strstr(aname, "Helmet_Lv2")) { snprintf(name, max_len, "Helmet L2"); *category = 2; return; }
+    if (strstr(aname, "Helmet_1") || strstr(aname, "Helmet_Lv1")) { snprintf(name, max_len, "Helmet L1"); *category = 2; return; }
+    if (strstr(aname, "Armor_3") || strstr(aname, "Vest_3")) { snprintf(name, max_len, "Vest L3"); *category = 2; return; }
+    if (strstr(aname, "Armor_2") || strstr(aname, "Vest_2")) { snprintf(name, max_len, "Vest L2"); *category = 2; return; }
+    if (strstr(aname, "Armor_1") || strstr(aname, "Vest_1")) { snprintf(name, max_len, "Vest L1"); *category = 2; return; }
+    if (strstr(aname, "Bag_3") || strstr(aname, "Backpack_3")) { snprintf(name, max_len, "Bag L3"); *category = 2; return; }
+    if (strstr(aname, "Bag_2") || strstr(aname, "Backpack_2")) { snprintf(name, max_len, "Bag L2"); *category = 2; return; }
+    if (strstr(aname, "Bag_1") || strstr(aname, "Backpack_1")) { snprintf(name, max_len, "Bag L1"); *category = 2; return; }
+    if (strstr(aname, "FirstAid")) { snprintf(name, max_len, "FirstAid"); *category = 3; return; }
+    if (strstr(aname, "MedKit")) { snprintf(name, max_len, "MedKit"); *category = 3; return; }
+    if (strstr(aname, "Drink")) { snprintf(name, max_len, "EnergyDrink"); *category = 3; return; }
+    if (strstr(aname, "Pain")) { snprintf(name, max_len, "Painkiller"); *category = 3; return; }
+    if (strstr(aname, "Adrenaline")) { snprintf(name, max_len, "Adrenaline"); *category = 3; return; }
+    if (strstr(aname, "Bandage")) { snprintf(name, max_len, "Bandage"); *category = 3; return; }
+    if (strstr(aname, "8x") || strstr(aname, "Scope8x")) { snprintf(name, max_len, "8x Scope"); *category = 4; return; }
+    if (strstr(aname, "6x") || strstr(aname, "Scope6x")) { snprintf(name, max_len, "6x Scope"); *category = 4; return; }
+    if (strstr(aname, "4x") || strstr(aname, "Scope4x")) { snprintf(name, max_len, "4x Scope"); *category = 4; return; }
+    if (strstr(aname, "3x") || strstr(aname, "Scope3x")) { snprintf(name, max_len, "3x Scope"); *category = 4; return; }
+    if (strstr(aname, "2x") || strstr(aname, "Scope2x")) { snprintf(name, max_len, "2x Scope"); *category = 4; return; }
+    if (strstr(aname, "RedDot")) { snprintf(name, max_len, "RedDot"); *category = 4; return; }
+    if (strstr(aname, "Holo")) { snprintf(name, max_len, "Holo"); *category = 4; return; }
+    if (strstr(aname, "556") || strstr(aname, "5.56")) { snprintf(name, max_len, "5.56 Ammo"); *category = 4; return; }
+    if (strstr(aname, "762") || strstr(aname, "7.62")) { snprintf(name, max_len, "7.62 Ammo"); *category = 4; return; }
+    if (strstr(aname, "300") || strstr(aname, "Magnum")) { snprintf(name, max_len, ".300 Mag"); *category = 4; return; }
+    if (strstr(aname, "9mm")) { snprintf(name, max_len, "9mm Ammo"); *category = 4; return; }
+    if (strstr(aname, "45")) { snprintf(name, max_len, ".45 Ammo"); *category = 4; return; }
+    if (strstr(aname, "AirDrop") || strstr(aname, "DropBox")) { snprintf(name, max_len, "Air Drop"); *category = 5; return; }
+    if (strstr(aname, "DeadBox") || strstr(aname, "PlayerDeadBox") || strstr(aname, "PickUpListWrapperActor")) {
+        snprintf(name, max_len, "Player Crate"); *category = 5; return;
     }
 }
 
 static void resolve_vehicle_name(const char *cls_name, char *name, size_t max_len) {
     if (!cls_name || !cls_name[0]) { snprintf(name, max_len, "Vehicle"); return; }
-    if (strstr(cls_name, "Buggy")) snprintf(name, max_len, "Buggy");
+    if (strstr(cls_name, "Airplane") || strstr(cls_name, "AirDropPlane") || strstr(cls_name, "C130") || strstr(cls_name, "Plane")) {
+        snprintf(name, max_len, "Airplane");
+    } else if (strstr(cls_name, "Glider") || strstr(cls_name, "MotorGlider")) {
+        snprintf(name, max_len, "Glider");
+    } else if (strstr(cls_name, "Helicopter") || strstr(cls_name, "Heli")) {
+        snprintf(name, max_len, "Helicopter");
+    } else if (strstr(cls_name, "Buggy")) snprintf(name, max_len, "Buggy");
     else if (strstr(cls_name, "Dacia")) snprintf(name, max_len, "Dacia");
     else if (strstr(cls_name, "UAZ") || strstr(cls_name, "Uaz")) snprintf(name, max_len, "UAZ");
     else if (strstr(cls_name, "Motorcycle") || strstr(cls_name, "Bike")) snprintf(name, max_len, "Motorcycle");
@@ -221,7 +370,9 @@ static cls_type_t classify_class(uint64_t cls, uint64_t actor_sample) {
         type = CLS_PLAYER;
     } else if (strstr(name, "Vehicle") || strstr(name, "VH_") || strstr(name, "Buggy") ||
                strstr(name, "Dacia") || strstr(name, "UAZ") || strstr(name, "Motorcycle") ||
-               strstr(name, "Bike") || strstr(name, "Boat") || strstr(name, "PickUp_")) {
+               strstr(name, "Bike") || strstr(name, "Boat") || strstr(name, "PickUp_") ||
+               strstr(name, "Airplane") || strstr(name, "Plane") || strstr(name, "Glider") ||
+               strstr(name, "Helicopter") || strstr(name, "C130")) {
         if (!strstr(name, "Wheel") && !strstr(name, "Movement") && !strstr(name, "Anim") && !strstr(name, "Spawner") && !strstr(name, "Manager")) {
             type = CLS_VEHICLE;
         }
@@ -238,7 +389,8 @@ static cls_type_t classify_class(uint64_t cls, uint64_t actor_sample) {
                 !strstr(sname, "Controller") && !strstr(sname, "Start") &&
                 !strstr(sname, "State") && !strstr(sname, "Camera")) {
                 type = CLS_PLAYER;
-            } else if (strstr(sname, "Vehicle") || strstr(sname, "VH_")) {
+            } else if (strstr(sname, "Vehicle") || strstr(sname, "VH_") ||
+                       strstr(sname, "Airplane") || strstr(sname, "Plane") || strstr(sname, "Glider")) {
                 if (!strstr(sname, "Wheel") && !strstr(sname, "Movement") && !strstr(sname, "Anim")) {
                     type = CLS_VEHICLE;
                 }
@@ -442,6 +594,7 @@ int radar_init(mach_port_t target, uint64_t image_base, uint64_t aslr_slide) {
     item_count = 0;
     next_scan_time = 0;
     g_class_count = 0;
+    s_cached_local_team = 0;
 
     logfile = fopen("/var/mobile/Downloads/ue4_radar.log", "a");
     fd = open(RADAR_FILE_PATH, O_RDWR | O_CREAT, 0644);
@@ -495,13 +648,28 @@ int radar_tick(void) {
     }
 
     /* Read local player team */
-    if (pawn) {
-        uint64_t local_st = ptr(pawn, 0x2410);
-        if (!local_st) local_st = ptr(pawn, 0x4d0);
+    if (pawn || pc) {
+        uint64_t local_st = 0;
+        if (pawn) {
+            local_st = ptr(pawn, 0x2410);
+            if (!local_st) local_st = ptr(pawn, 0x4d0);
+        }
+        if (!local_st && pc) {
+            local_st = ptr(pc, 0x488);
+            if (!local_st) local_st = ptr(pc, 0x4f0);
+            if (!local_st) local_st = ptr(pc, 0x500);
+            if (!local_st) local_st = ptr(pc, 0x508);
+        }
         if (local_st) {
             uint32_t t = 0;
-            if (rm_read(task, local_st + 0x700, &t, 4)) frame.header.local_team = t;
+            if (rm_read(task, local_st + 0x700, &t, 4) && t > 0) {
+                frame.header.local_team = t;
+                s_cached_local_team = t;
+            }
         }
+    }
+    if (frame.header.local_team == 0 && s_cached_local_team > 0) {
+        frame.header.local_team = s_cached_local_team;
     }
 
     /* Actor discovery cadence */
@@ -565,7 +733,15 @@ int radar_tick(void) {
             rm_read(task, st + 0x700, &p.team_id, 4);
             uint8_t raw_bot = 0;
             rm_read(task, st + 0x4dc, &raw_bot, 1);
-            p.is_bot = (raw_bot & 0x08) ? 1 : ((raw_bot != 0) ? 1 : 0);
+            /* In UE4 PlayerState at offset 1244 (0x4dc), bit 2 (0x04) is bIsABot.
+             * Bit 3 (0x08) is bIsInactive, bit 4 (0x10) is bFromPreviousLevel.
+             * Only bit 2 indicates an AI bot. */
+            p.is_bot = (raw_bot & 0x04) ? 1 : 0;
+
+            /* Critical Invariant: Teammates on our team can NEVER be classified as bots */
+            if (frame.header.local_team != 0 && p.team_id == frame.header.local_team) {
+                p.is_bot = 0;
+            }
 
             /* Player Name */
             if (!read_fstring(task, st + 0x4b8, p.name, sizeof(p.name))) {
@@ -576,6 +752,10 @@ int radar_tick(void) {
             }
         } else {
             snprintf(p.name, sizeof(p.name), "Player");
+        }
+        /* Critical Invariant: Teammates on our team can NEVER be classified as bots */
+        if (frame.header.local_team != 0 && p.team_id == frame.header.local_team) {
+            p.is_bot = 0;
         }
 
         /* Distance */
@@ -608,11 +788,11 @@ int radar_tick(void) {
         /* Left leg */
         p.bones[10] = (rvec3_t){ p.pos.x - right_x * 12.0f, p.pos.y - right_y * 12.0f, p.pos.z + 0.0f };  /* L Hip */
         p.bones[11] = (rvec3_t){ p.bones[10].x, p.bones[10].y, p.bones[10].z - 42.0f };                     /* L Knee */
-        p.bones[12] = (rvec3_t){ p.bones[11].x, p.bones[11].y, p.bones[11].z - 40.0f };                     /* L Foot */
+        p.bones[12] = (rvec3_t){ p.bones[11].x, p.bones[11].y, p.bones[11].z - 43.0f };                     /* L Ankle */
         /* Right leg */
         p.bones[13] = (rvec3_t){ p.pos.x + right_x * 12.0f, p.pos.y + right_y * 12.0f, p.pos.z + 0.0f };  /* R Hip */
         p.bones[14] = (rvec3_t){ p.bones[13].x, p.bones[13].y, p.bones[13].z - 42.0f };                     /* R Knee */
-        p.bones[15] = (rvec3_t){ p.bones[14].x, p.bones[14].y, p.bones[14].z - 40.0f };                     /* R Foot */
+        p.bones[15] = (rvec3_t){ p.bones[14].x, p.bones[14].y, p.bones[14].z - 43.0f };                     /* R Ankle */
         p.has_bones = 1;
 
         frame.players[frame.header.player_count++] = p;
@@ -634,7 +814,7 @@ int radar_tick(void) {
         float dy = v.pos.y - camera_pos.y;
         float dz = v.pos.z - camera_pos.z;
         v.distance = sqrtf(dx*dx + dy*dy + dz*dz) / 100.0f;
-        if (v.distance > 500.0f) continue; /* Skip vehicles beyond 500m */
+        if (v.distance > 800.0f) continue; /* Skip vehicles beyond 800m */
 
         float fwd_speed = 0.0f;
         rm_read(task, vactor + 0xcd0, &fwd_speed, 4);
@@ -657,6 +837,11 @@ int radar_tick(void) {
         }
         resolve_vehicle_name(cls_buf, v.name, sizeof(v.name));
 
+        /* Mark air vehicles with can_boost = 1 so overlay can filter them */
+        if (strstr(v.name, "Airplane") || strstr(v.name, "Glider") || strstr(v.name, "Helicopter")) {
+            v.can_boost = 1;
+        }
+
         frame.vehicles[frame.header.vehicle_count++] = v;
     }
 
@@ -678,11 +863,49 @@ int radar_tick(void) {
         item.distance = sqrtf(dx*dx + dy*dy + dz*dz) / 100.0f;
         if (item.distance > 120.0f) continue; /* Skip distant loot */
 
-        rm_read(task, iactor + 0x758, &item.item_id, 4);
+        /* Enhanced multi-offset ItemId resolution for PickUpWrapperActor & PickUpListWrapperActor */
+        rm_read(task, iactor + 0x758, &item.item_id, 4);  /* Primary ItemId (1880) */
+        if (item.item_id <= 0) {
+            rm_read(task, iactor + 1528, &item.item_id, 4); /* DefineID struct TypeSpecificID (1528 / 0x5F8) */
+        }
+        if (item.item_id <= 0) {
+            /* PickUpListWrapperActor: read PickUpDataList TArray at offset 2408 (0x968) */
+            uint64_t list_data = ptr(iactor, 2408);
+            if (list_data) {
+                rm_read(task, list_data, &item.item_id, 4);
+            }
+        }
         rm_read(task, iactor + 0x610, &item.count, 4);
         if (item.count <= 0) item.count = 1;
 
-        resolve_item_info(item.item_id, item.name, sizeof(item.name), &item.category);
+        item.name[0] = '\0';
+        if (item.item_id > 0) {
+            resolve_item_info(item.item_id, item.name, sizeof(item.name), &item.category);
+        }
+
+        /* If item name is unresolved or generic, resolve via actor name, class name, and PickupMesh */
+        if (item.name[0] == '\0' || strncmp(item.name, "Item", 4) == 0 || strcmp(item.name, "Loot Crate") == 0) {
+            char aname[128] = {0};
+            if (reflection && ue4r_resolve_name(reflection, iactor + OFF_UOBJECT_NAME, aname, sizeof(aname))) {
+                resolve_item_from_actor_name(aname, item.name, sizeof(item.name), &item.category);
+            }
+            if (item.name[0] == '\0' || strncmp(item.name, "Item", 4) == 0 || strcmp(item.name, "Loot Crate") == 0) {
+                uint64_t acls = ptr(iactor, 0x10);
+                if (acls && reflection && ue4r_resolve_name(reflection, acls + OFF_UOBJECT_NAME, aname, sizeof(aname))) {
+                    resolve_item_from_actor_name(aname, item.name, sizeof(item.name), &item.category);
+                }
+            }
+            if (item.name[0] == '\0' || strncmp(item.name, "Item", 4) == 0 || strcmp(item.name, "Loot Crate") == 0) {
+                uint64_t pmesh = ptr(iactor, 1816); /* PickupMesh (0x718) */
+                if (pmesh && reflection && ue4r_resolve_name(reflection, pmesh + OFF_UOBJECT_NAME, aname, sizeof(aname))) {
+                    resolve_item_from_actor_name(aname, item.name, sizeof(item.name), &item.category);
+                }
+            }
+        }
+        if (item.name[0] == '\0') {
+            snprintf(item.name, sizeof(item.name), "Supply");
+            item.category = 5;
+        }
 
         frame.items[frame.header.item_count++] = item;
     }
@@ -718,4 +941,5 @@ void radar_destroy(void) {
     }
     task = MACH_PORT_NULL;
     world = 0;
+    s_cached_local_team = 0;
 }

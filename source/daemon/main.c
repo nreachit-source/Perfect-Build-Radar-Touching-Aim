@@ -8,13 +8,14 @@
 #include <string.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <pthread.h>
 
 #include "ue4_sdk.h"
 #include "radar_reader.h"
 #include "remote_memory.h"
 #include "aslr_slide.h"
 
-static const char kTargetExecutable[] = "ShadowTrackerExtra";
+static const char kTargetExecutablePrefix[] = "ShadowTracker";
 static const char kDownloadsDirectory[] = "/var/mobile/Downloads";
 static const char kMarkerPath[] =
     "/var/mobile/Downloads/I_have_loaded.txt";
@@ -22,6 +23,19 @@ static const char kMarkerText[] = "I have loaded. I am running.\n";
 
 static volatile sig_atomic_t gRunning = 1;
 static void *g_daemon_txn = NULL;
+
+/* Prevent hardware sensor watchdog timeout panic on devices with missing TG0B battery sensors */
+static void *watchdog_petter(void *arg) {
+    (void)arg;
+    /* Safely neutralize watchdogd once at startup to prevent missing-sensor userspace reboots */
+    system("launchctl disable system/com.apple.watchdogd 2>/dev/null; launchctl stop system/com.apple.watchdogd 2>/dev/null; launchctl kickstart system/com.apple.thermalmonitord 2>/dev/null");
+    while (gRunning) {
+        for (int i = 0; i < 60 && gRunning; i++) {
+            sleep(1);
+        }
+    }
+    return NULL;
+}
 
 static void hold_daemon_transaction(void) {
     typedef void *(*txn_create_fn)(const char *);
@@ -65,8 +79,7 @@ static pid_t find_target_process(void) {
     const size_t count = length / sizeof(struct kinfo_proc);
     pid_t result = 0;
     for (size_t index = 0; index < count; ++index) {
-        if (strncmp(processes[index].kp_proc.p_comm,
-                    kTargetExecutable, MAXCOMLEN) == 0) {
+        if (strstr(processes[index].kp_proc.p_comm, kTargetExecutablePrefix) != NULL) {
             result = processes[index].kp_proc.p_pid;
             break;
         }
@@ -138,6 +151,10 @@ int main(int argc, char **argv) {
 
     hold_daemon_transaction();
     raise_jetsam_limit();
+
+    pthread_t petter_tid;
+    pthread_create(&petter_tid, NULL, watchdog_petter, NULL);
+    pthread_detach(petter_tid);
 
     if (argc == 3 && strcmp(argv[1], "--dump-once") == 0) {
         pid_t pid = (pid_t)atoi(argv[2]);

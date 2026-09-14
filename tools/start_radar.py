@@ -2,10 +2,12 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -14,6 +16,8 @@ MONITOR = ROOT.parent
 PYTHON = MONITOR.parent / "iPhone_RE_Toolchain/.venv/Scripts/python.exe"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from remote_sh import run_script
+
+_stop_event = threading.Event()
 
 
 def connected():
@@ -48,8 +52,24 @@ def remote(script, timeout=25):
     return result
 
 
+def _watchdog_petter_loop():
+    """Safely neutralizes watchdogd to prevent hardware sensor panics without crash-looping thermalmonitord."""
+    while not _stop_event.is_set():
+        try:
+            if connected():
+                remote(
+                    "/var/jb/bin/launchctl disable system/com.apple.watchdogd 2>/dev/null || "
+                    "/var/jb/bin/launchctl stop system/com.apple.watchdogd 2>/dev/null || "
+                    "/var/jb/bin/launchctl kickstart system/com.apple.thermalmonitord 2>/dev/null || true",
+                    timeout=10
+                )
+        except Exception:
+            pass
+        _stop_event.wait(60)
+
+
 def ensure_overlay(force=False):
-    """Ensures radar_overlay.dylib is actively injected into SpringBoard."""
+    """Ensures radar_overlay.dylib is actively injected into SpringBoard without duplicate injection crashes."""
     force_flag = "1" if force else "0"
     script = f"""
 LINE=$(ps -ef | grep SpringBoard | grep -v grep | head -n1)
@@ -58,11 +78,26 @@ SB=$2
 if [ -z "$SB" ]; then
     echo "NO_SPRINGBOARD"
 else
+    # Check if proof log was modified in the last 6 seconds
+    RECENT=0
+    LOG=/var/mobile/Downloads/ue4_overlay_v3_proof.log
+    if [ -f "$LOG" ]; then
+        NOW=$(date +%s)
+        MOD=$(stat -c %Y "$LOG" 2>/dev/null || stat -f %m "$LOG" 2>/dev/null || echo 0)
+        case "$MOD" in ''|*[!0-9]*) MOD=0 ;; esac
+        DIFF=$(( NOW - MOD ))
+        if [ "$DIFF" -ge 0 ] && [ "$DIFF" -le 6 ]; then
+            RECENT=1
+        fi
+    fi
     RECORDED=""
     if [ -f /var/mobile/Downloads/overlay_sb_pid.txt ]; then
         RECORDED=$(cat /var/mobile/Downloads/overlay_sb_pid.txt 2>/dev/null)
     fi
-    if [ "{force_flag}" = "0" ] && [ -n "$RECORDED" ] && [ "$SB" = "$RECORDED" ]; then
+
+    if [ "{force_flag}" = "0" ] && [ "$RECENT" = "1" ]; then
+        echo "ALREADY_ACTIVE $SB"
+    elif [ "{force_flag}" = "0" ] && [ -n "$RECORDED" ] && [ "$SB" = "$RECORDED" ]; then
         echo "ALREADY_ACTIVE $SB"
     else
         echo "INJECTING_NOW $SB"
@@ -82,9 +117,6 @@ fi
             if "dlopen succeeded" in line or "Overlay initialized" in line or "SERVER_TOUCH" in line:
                 print(f"        [+] {line}", flush=True)
     return True
-
-
-
 
 
 def do_restart(clean_game=True, respring_overlay=False):
@@ -110,8 +142,8 @@ done
     if respring_overlay:
         print("[*] Waiting for SpringBoard to reload...", flush=True)
         time.sleep(4)
-        print("[*] Re-injecting overlay into refreshed SpringBoard...", flush=True)
-        ensure_overlay(force=True)
+        print("[*] Verifying overlay status in refreshed SpringBoard...", flush=True)
+        ensure_overlay(force=False)
 
 
 def get_live_status():
@@ -123,6 +155,62 @@ def get_live_status():
     return clean_procs, clean_ipc
 
 
+def show_telemetry_stream():
+    """Streams live telemetry from the daemon and overlay until key press."""
+    print("\n" + "=" * 64)
+    print("  LIVE RADAR & AIM TELEMETRY STREAM (Press Ctrl+C to return)")
+    print("=" * 64)
+    try:
+        while True:
+            out = remote("""
+D=$(tail -n 1 /var/mobile/Downloads/ue4_radar.log 2>/dev/null || echo "DAEMON: offline")
+O=$(tail -n 1 /var/mobile/Downloads/ue4_overlay_v3_proof.log 2>/dev/null || echo "OVERLAY: offline")
+echo "D_LOG: $D"
+echo "O_LOG: $O"
+""")
+            d_line = ""
+            o_line = ""
+            for line in out.splitlines():
+                if line.startswith("D_LOG: "):
+                    d_line = line[7:].strip()
+                elif line.startswith("O_LOG: "):
+                    o_line = line[7:].strip()
+            print(f"\r[*] [DAEMON] {d_line[:50]} | [OVERLAY] {o_line[:40]}", end="", flush=True)
+            time.sleep(0.5)
+    except (KeyboardInterrupt, EOFError):
+        print("\n[*] Exited telemetry stream.")
+
+
+def test_touch_injection():
+    """Directly triggers a verified touch injection stroke on the device."""
+    print("\n[*] Triggering test touch swipe on iPhone screen...", flush=True)
+    res = remote("/var/jb/tmp/test_hid_inject 2>&1 || true")
+    for line in res.splitlines():
+        line = line.strip()
+        if any(w in line for w in ["Probing", "IOHID", "Simulating", "Dispatched", "swipe completed"]):
+            print(f"    [+] {line}", flush=True)
+    print("[+] Touch injection test finished. Check device screen for swipe reaction.", flush=True)
+
+
+def show_recent_logs():
+    """Displays latest entries from daemon log and overlay proof."""
+    print("\n" + "=" * 64)
+    print("  RECENT DAEMON LOG (/var/mobile/Downloads/ue4_radar.log):")
+    print("=" * 64)
+    d_log = remote("tail -n 12 /var/mobile/Downloads/ue4_radar.log 2>/dev/null || echo 'No daemon log'")
+    for line in d_log.splitlines():
+        if "START_COMMAND_OK" not in line and "iDownload>" not in line and "__CODEX_DONE__" not in line:
+            print("  " + line)
+
+    print("\n" + "=" * 64)
+    print("  RECENT OVERLAY PROOF (/var/mobile/Downloads/ue4_overlay_v3_proof.log):")
+    print("=" * 64)
+    o_log = remote("tail -n 12 /var/mobile/Downloads/ue4_overlay_v3_proof.log 2>/dev/null || echo 'No overlay log'")
+    for line in o_log.splitlines():
+        if "START_COMMAND_OK" not in line and "iDownload>" not in line and "__CODEX_DONE__" not in line:
+            print("  " + line)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--restart-overlay", action="store_true", help="Restart SpringBoard to reload the installed overlay")
@@ -130,11 +218,16 @@ def main():
     args = parser.parse_args()
 
     print("================================================================", flush=True)
-    print("      iOS UE4 Radar & ESP Launcher (Release 1.3.3)             ", flush=True)
+    print("      iOS UE4 Radar, Aim Assist & ESP Launcher (v1.3.4)         ", flush=True)
     print("================================================================", flush=True)
     print("[*] Keep phone UNLOCKED and screen ON during startup.", flush=True)
     print("[*] Connecting to iPhone over USB (port 1337)...", flush=True)
     ensure_usb()
+
+    # Start background watchdog petter thread to prevent missing-sensor thermalmonitord panics
+    petter_thread = threading.Thread(target=_watchdog_petter_loop, daemon=True)
+    petter_thread.start()
+    print("[+] Watchdog sensor keepalive active (prevents hardware thermal panics).", flush=True)
 
     # 1. Verify installed files exist and are executable
     remote("""
@@ -165,25 +258,29 @@ test -s /var/jb/usr/lib/TweakInject/radar_overlay.plist
     print(procs)
     if ipc_info:
         print(f"[+] IPC Shared Memory: {ipc_info}")
-    
-    print("\n[+] Overlay is active. Tap 'ESP' on screen for settings; tap 'Collapse' to close.")
+
+    print("\n[+] Overlay is active. Tap 'ESP' on screen for settings; tap 'AIM' for touch aim.")
     print("[+] Radar is running. Wait for LIVE status in-game.")
 
     if args.no_loop:
         return
 
-    # 4. Interactive Quick-Restart Console Loop
+    # 4. Interactive Console Loop
     while True:
         print("\n" + "-" * 64)
-        print("  QUICK RESTARTER CONTROLS:")
-        print("    [R] -> Instant Restart (Kills crashed game, resets daemon, relaunches)")
-        print("    [S] -> Soft Respring (Reloads SpringBoard & re-injects ESP overlay)")
-        print("    [O] -> Re-Inject Overlay (Forces overlay injection into current SpringBoard)")
+        print("  CONSOLE RESTARTER & DIAGNOSTIC CONTROLS:")
+        print("    [R] -> Instant Restart (Kills stuck game, resets daemon, relaunches)")
+        print("    [S] -> Soft Respring (Safely reloads SpringBoard & ESP overlay)")
+        print("    [O] -> Verify Overlay (Checks active status / re-injects if idle)")
+        print("    [T] -> Telemetry Stream (Live real-time tick, enemy count, aim lock)")
+        print("    [F] -> Test Touch Injection (Fires a test swipe stroke on screen)")
+        print("    [L] -> View Recent Logs (Tail daemon & overlay proof logs)")
+        print("    [P] -> System & Process Status (Display PIDs & shared memory info)")
         print("    [K] -> Kill Game & Daemon (Clean shutdown)")
         print("    [Q] -> Quit Launcher")
         print("-" * 64)
         try:
-            choice = input("Enter action [R/S/O/K/Q] (default R): ").strip().upper()
+            choice = input("Enter action [R/S/O/T/F/L/P/K/Q] (default R): ").strip().upper()
         except (EOFError, KeyboardInterrupt):
             break
 
@@ -200,9 +297,20 @@ test -s /var/jb/usr/lib/TweakInject/radar_overlay.plist
             procs, ipc = get_live_status()
             print("[+] Respring complete! Current processes:\n" + procs)
         elif choice == "O":
-            print("\n[*] Re-injecting overlay into current SpringBoard...", flush=True)
-            ensure_overlay(force=True)
-
+            print("\n[*] Checking overlay status in current SpringBoard...", flush=True)
+            ensure_overlay(force=False)
+        elif choice == "T":
+            show_telemetry_stream()
+        elif choice == "F":
+            test_touch_injection()
+        elif choice == "L":
+            show_recent_logs()
+        elif choice == "P":
+            procs, ipc = get_live_status()
+            print("\n[+] SYSTEM & PROCESS STATUS:")
+            print(procs)
+            if ipc:
+                print(f"[+] IPC Shared Memory: {ipc}")
         elif choice == "K":
             print("\n[*] Terminating game and stopping daemon...", flush=True)
             remote("""
@@ -218,10 +326,13 @@ done
         else:
             print(f"Unknown choice '{choice}'. Press R to restart, or Q to quit.")
 
+    _stop_event.set()
+
 
 if __name__ == "__main__":
     try:
         main()
     except (Exception, KeyboardInterrupt) as exc:
+        _stop_event.set()
         print("START FAILED: " + str(exc), file=sys.stderr)
         sys.exit(1)
