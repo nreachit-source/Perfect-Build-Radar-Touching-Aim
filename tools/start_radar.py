@@ -41,17 +41,50 @@ def ensure_usb():
     raise RuntimeError("USB forwarding failed. Connect and unlock the phone, trust this PC, and enable iDownload in the jailbreak app. See start_usb.log.")
 
 
-def remote(script):
-    result = run_script("set -e\n" + script + "\necho START_COMMAND_OK\n", timeout=12)
+def remote(script, timeout=25):
+    result = run_script(script + "\necho START_COMMAND_OK\n", timeout=timeout)
     if "START_COMMAND_OK" not in result:
         raise RuntimeError(result.strip() or "No response from phone. Enable iDownload and check USB.")
     return result
 
 
-def overlay_tick():
-    result = remote("tail -100 /var/mobile/Downloads/ue4_overlay_v3_proof.log 2>/dev/null || true")
-    ticks = re.findall(r"^timer=(\d+).*", result, re.M)
-    return ticks[-1] if ticks else None
+def ensure_overlay(force=False):
+    """Ensures radar_overlay.dylib is actively injected into SpringBoard."""
+    force_flag = "1" if force else "0"
+    script = f"""
+LINE=$(ps -ef | grep SpringBoard | grep -v grep | head -n1)
+set -- $LINE
+SB=$2
+if [ -z "$SB" ]; then
+    echo "NO_SPRINGBOARD"
+else
+    RECORDED=""
+    if [ -f /var/mobile/Downloads/overlay_sb_pid.txt ]; then
+        RECORDED=$(cat /var/mobile/Downloads/overlay_sb_pid.txt 2>/dev/null)
+    fi
+    if [ "{force_flag}" = "0" ] && [ -n "$RECORDED" ] && [ "$SB" = "$RECORDED" ]; then
+        echo "ALREADY_ACTIVE $SB"
+    else
+        echo "INJECTING_NOW $SB"
+        /var/jb/basebin/jbctl proc_set_debugged "$SB" 2>&1 || true
+        /var/jb/basebin/opainject "$SB" /var/jb/usr/lib/TweakInject/radar_overlay.dylib 2>&1 || true
+        echo "$SB" > /var/mobile/Downloads/overlay_sb_pid.txt
+    fi
+fi
+"""
+    res = remote(script, timeout=25)
+    if "ALREADY_ACTIVE" in res:
+        print("    [+] Overlay is already active in current SpringBoard.", flush=True)
+    elif "INJECTING_NOW" in res:
+        print("    [+] Overlay successfully injected into SpringBoard!", flush=True)
+        for line in res.splitlines():
+            line = line.strip()
+            if "dlopen succeeded" in line or "Overlay initialized" in line or "SERVER_TOUCH" in line:
+                print(f"        [+] {line}", flush=True)
+    return True
+
+
+
 
 
 def do_restart(clean_game=True, respring_overlay=False):
@@ -66,20 +99,27 @@ done
     cmds.append("rm -f /var/jb/basebin/.safe_mode 2>/dev/null || true")
     if respring_overlay:
         cmds.append("/var/jb/usr/bin/sbreload 2>/dev/null || true")
+        cmds.append("rm -f /var/mobile/Downloads/overlay_sb_pid.txt 2>/dev/null || true")
     cmds.append("""
 /var/jb/bin/launchctl kickstart -k user/501/com.local.ue4loadmonitor 2>/dev/null || \
 /var/jb/bin/launchctl kickstart -k system/com.local.ue4loadmonitor 2>/dev/null || true
-/var/jb/usr/bin/uiopen --bundleid com.tencent.ig 2>/dev/null || true
+/var/jb/usr/bin/uiopen --bundleid com.tencent.ig >/dev/null 2>&1 &
 """)
     remote("\n".join(cmds))
+
+    if respring_overlay:
+        print("[*] Waiting for SpringBoard to reload...", flush=True)
+        time.sleep(4)
+        print("[*] Re-injecting overlay into refreshed SpringBoard...", flush=True)
+        ensure_overlay(force=True)
 
 
 def get_live_status():
     """Returns running processes and radar bin info."""
     procs = remote("ps -A -o pid,comm | grep -E 'ue4loadmonitor|ShadowTracker|SpringBoard' || true")
     ipc_info = remote("ls -la /var/mobile/Downloads/ue4_radar.bin 2>/dev/null || true")
-    clean_procs = "\n".join(l for l in procs.splitlines() if l.strip() and "START_COMMAND_OK" not in l and "iDownload>" not in l)
-    clean_ipc = "\n".join(l for l in ipc_info.splitlines() if l.strip() and "START_COMMAND_OK" not in l and "iDownload>" not in l)
+    clean_procs = "\n".join(l for l in procs.splitlines() if l.strip() and "START_COMMAND_OK" not in l and "iDownload>" not in l and "__CODEX_DONE__" not in l)
+    clean_ipc = "\n".join(l for l in ipc_info.splitlines() if l.strip() and "START_COMMAND_OK" not in l and "iDownload>" not in l and "__CODEX_DONE__" not in l)
     return clean_procs, clean_ipc
 
 
@@ -110,20 +150,10 @@ test -s /var/jb/usr/lib/TweakInject/radar_overlay.plist
 
     print(f"[+] Verified installation for UE4 Load Monitor {manifest['version']}", flush=True)
 
-    # 2. Check overlay heartbeat and ensure active
-    tick = overlay_tick()
-    if args.restart_overlay or not tick:
-        print("[*] Activating / reloading overlay in SpringBoard...", flush=True)
-        remote("""
-LINE=$(ps -ef | grep SpringBoard | grep -v grep | head -n1)
-set -- $LINE
-SB=$2
-if [ -n "$SB" ]; then
-    /var/jb/basebin/jbctl proc_set_debugged "$SB" 2>/dev/null || true
-    /var/jb/basebin/opainject "$SB" /var/jb/usr/lib/TweakInject/radar_overlay.dylib 2>/dev/null || true
-fi
-""")
-        time.sleep(2)
+    # 2. Ensure overlay is injected and active in current SpringBoard
+    print("[*] Checking SpringBoard overlay status...", flush=True)
+    ensure_overlay(force=args.restart_overlay)
+    time.sleep(1.5)
 
     # 3. Launch / Restart game and daemon
     print("[*] Launching Radar Daemon and PUBG Mobile...", flush=True)
@@ -147,12 +177,13 @@ fi
         print("\n" + "-" * 64)
         print("  QUICK RESTARTER CONTROLS:")
         print("    [R] -> Instant Restart (Kills crashed game, resets daemon, relaunches)")
-        print("    [S] -> Soft Respring (Reloads SpringBoard & ESP overlay)")
+        print("    [S] -> Soft Respring (Reloads SpringBoard & re-injects ESP overlay)")
+        print("    [O] -> Re-Inject Overlay (Forces overlay injection into current SpringBoard)")
         print("    [K] -> Kill Game & Daemon (Clean shutdown)")
         print("    [Q] -> Quit Launcher")
         print("-" * 64)
         try:
-            choice = input("Enter action [R/S/K/Q] (default R): ").strip().upper()
+            choice = input("Enter action [R/S/O/K/Q] (default R): ").strip().upper()
         except (EOFError, KeyboardInterrupt):
             break
 
@@ -168,6 +199,10 @@ fi
             time.sleep(4)
             procs, ipc = get_live_status()
             print("[+] Respring complete! Current processes:\n" + procs)
+        elif choice == "O":
+            print("\n[*] Re-injecting overlay into current SpringBoard...", flush=True)
+            ensure_overlay(force=True)
+
         elif choice == "K":
             print("\n[*] Terminating game and stopping daemon...", flush=True)
             remote("""
