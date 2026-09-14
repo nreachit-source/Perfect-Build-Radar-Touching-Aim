@@ -51,7 +51,9 @@ def main():
             '-DUE4_SDK_LOG_PATH="/var/jb/tmp/codex_sdk_regression.log"',
             '-DUE4_SDK_CONFIG_PATH="/var/jb/tmp/codex_sdk_regression.config"',
             str(ROOT / "tests/sdk_regression.c"), str(src / "ue4_sdk.c"), str(src / "ue4_json.c")],
-        "test_dlopen": [str(ROOT.parent / "test_dlopen.c")],
+        "test_dlopen": [str(ROOT / "tests/test_dlopen.c")],
+        "menu_runtime_test.dylib": ["-x", "c", "-dynamiclib", "-Wl,-undefined,dynamic_lookup",
+                                     str(ROOT / "tests/menu_runtime_test.c")],
     }
     for name, flags in targets.items():
         output = args.out / name

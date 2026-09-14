@@ -14,12 +14,12 @@
  *      - Distance in Meters (ON/OFF)
  *      - Team ID & Bot Badge (ON/OFF)
  *      - Player Skeleton Bones (ON/OFF)
+ *      - Head Dot Aim Marker (ON/OFF)
  *      - Vehicle ESP (ON/OFF)
  *      - Loot & Items ESP (ON/OFF)
  *      - Radar Range (100m / 200m / 400m)
- *      - Touch-Pass Mode (Active indicator)
- *   4. Smooth High-Performance Refresh: Dedicated ESP & Radar rendering without
- *      layout thrashing or game hitching.
+ *   4. Dynamic Landscape & Portrait orientation adaptation without stalling.
+ *   5. Smooth 20 Hz frame updates without layout thrashing or game hitching.
  *
  * Rules:
  *   - Never #include <syslog.h>
@@ -38,8 +38,11 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dlfcn.h>
 
 #include "../daemon/radar_data.h"
+
+/* Use system libSystem sincos intrinsics */
 
 /* ------------------------------------------------------------------ */
 /*  ObjC runtime declarations (no Apple SDK headers needed)           */
@@ -57,12 +60,23 @@ typedef bool BOOL;
 #define NO  0
 #define nil ((id)0)
 
-extern Class objc_getClass(const char *name);
-extern Class objc_allocateClassPair(Class superclass, const char *name, size_t extra);
-extern void  objc_registerClassPair(Class cls);
-extern BOOL  class_addMethod(Class cls, SEL sel, IMP imp, const char *types);
-extern id    objc_msgSend(id self, SEL op, ...);
-extern SEL   sel_registerName(const char *str);
+static Class (*fn_objc_getClass)(const char *name) = NULL;
+static Class (*fn_objc_allocateClassPair)(Class superclass, const char *name, size_t extra) = NULL;
+static void  (*fn_objc_registerClassPair)(Class cls) = NULL;
+static BOOL  (*fn_class_addMethod)(Class cls, SEL sel, IMP imp, const char *types) = NULL;
+static id    (*fn_objc_msgSend)(id self, SEL op, ...) = NULL;
+static SEL   (*fn_sel_registerName)(const char *str) = NULL;
+static Class (*fn_object_getClass)(id obj) = NULL;
+static const char *(*fn_class_getName)(Class cls) = NULL;
+
+#define objc_getClass fn_objc_getClass
+#define objc_allocateClassPair fn_objc_allocateClassPair
+#define objc_registerClassPair fn_objc_registerClassPair
+#define class_addMethod fn_class_addMethod
+#define objc_msgSend fn_objc_msgSend
+#define sel_registerName fn_sel_registerName
+#define object_getClass fn_object_getClass
+#define class_getName fn_class_getName
 
 /* CoreGraphics geometry types */
 typedef double CGFloat;
@@ -81,25 +95,65 @@ static inline BOOL in_rect(CGPoint p, CGRect r) {
            p.y < (r.origin.y + r.size.height);
 }
 
-/* CoreGraphics C functions */
+/* Dynamic CoreGraphics & logging function pointers to avoid flat dyld bind lookups */
 typedef void *CGContextRef;
-extern CGContextRef UIGraphicsGetCurrentContext(void);
-extern void CGContextSetRGBFillColor(CGContextRef c, CGFloat r, CGFloat g, CGFloat b, CGFloat a);
-extern void CGContextSetRGBStrokeColor(CGContextRef c, CGFloat r, CGFloat g, CGFloat b, CGFloat a);
-extern void CGContextFillEllipseInRect(CGContextRef c, CGRect rect);
-extern void CGContextStrokeEllipseInRect(CGContextRef c, CGRect rect);
-extern void CGContextSetLineWidth(CGContextRef c, CGFloat w);
-extern void CGContextMoveToPoint(CGContextRef c, CGFloat x, CGFloat y);
-extern void CGContextAddLineToPoint(CGContextRef c, CGFloat x, CGFloat y);
-extern void CGContextStrokePath(CGContextRef c);
-extern void CGContextAddArc(CGContextRef c, CGFloat x, CGFloat y, CGFloat radius,
-                             CGFloat startAngle, CGFloat endAngle, int clockwise);
-extern void CGContextFillRect(CGContextRef c, CGRect rect);
-extern void CGContextStrokeRect(CGContextRef c, CGRect rect);
 
-extern void NSLog(id format, ...);
+static CGContextRef (*fn_UIGraphicsGetCurrentContext)(void) = NULL;
+static void (*fn_CGContextSetRGBFillColor)(CGContextRef, CGFloat, CGFloat, CGFloat, CGFloat) = NULL;
+static void (*fn_CGContextSetRGBStrokeColor)(CGContextRef, CGFloat, CGFloat, CGFloat, CGFloat) = NULL;
+static void (*fn_CGContextFillEllipseInRect)(CGContextRef, CGRect) = NULL;
+static void (*fn_CGContextStrokeEllipseInRect)(CGContextRef, CGRect) = NULL;
+static void (*fn_CGContextSetLineWidth)(CGContextRef, CGFloat) = NULL;
+static void (*fn_CGContextMoveToPoint)(CGContextRef, CGFloat, CGFloat) = NULL;
+static void (*fn_CGContextAddLineToPoint)(CGContextRef, CGFloat, CGFloat) = NULL;
+static void (*fn_CGContextStrokePath)(CGContextRef) = NULL;
+static void (*fn_CGContextAddArc)(CGContextRef, CGFloat, CGFloat, CGFloat, CGFloat, CGFloat, int) = NULL;
+static void (*fn_CGContextFillRect)(CGContextRef, CGRect) = NULL;
+static void (*fn_CGContextStrokeRect)(CGContextRef, CGRect) = NULL;
+static void (*fn_NSLog)(id format, ...) = NULL;
+
+#define UIGraphicsGetCurrentContext fn_UIGraphicsGetCurrentContext
+#define CGContextSetRGBFillColor fn_CGContextSetRGBFillColor
+#define CGContextSetRGBStrokeColor fn_CGContextSetRGBStrokeColor
+#define CGContextFillEllipseInRect fn_CGContextFillEllipseInRect
+#define CGContextStrokeEllipseInRect fn_CGContextStrokeEllipseInRect
+#define CGContextSetLineWidth fn_CGContextSetLineWidth
+#define CGContextMoveToPoint fn_CGContextMoveToPoint
+#define CGContextAddLineToPoint fn_CGContextAddLineToPoint
+#define CGContextStrokePath fn_CGContextStrokePath
+#define CGContextAddArc fn_CGContextAddArc
+#define CGContextFillRect fn_CGContextFillRect
+#define CGContextStrokeRect fn_CGContextStrokeRect
+#define NSLog fn_NSLog
+
+static void resolve_cg_symbols(void) {
+    if (fn_UIGraphicsGetCurrentContext) return;
+    fn_UIGraphicsGetCurrentContext  = (CGContextRef (*)(void))dlsym(RTLD_DEFAULT, "UIGraphicsGetCurrentContext");
+    fn_CGContextSetRGBFillColor     = (void (*)(CGContextRef, CGFloat, CGFloat, CGFloat, CGFloat))dlsym(RTLD_DEFAULT, "CGContextSetRGBFillColor");
+    fn_CGContextSetRGBStrokeColor   = (void (*)(CGContextRef, CGFloat, CGFloat, CGFloat, CGFloat))dlsym(RTLD_DEFAULT, "CGContextSetRGBStrokeColor");
+    fn_CGContextFillEllipseInRect   = (void (*)(CGContextRef, CGRect))dlsym(RTLD_DEFAULT, "CGContextFillEllipseInRect");
+    fn_CGContextStrokeEllipseInRect = (void (*)(CGContextRef, CGRect))dlsym(RTLD_DEFAULT, "CGContextStrokeEllipseInRect");
+    fn_CGContextSetLineWidth        = (void (*)(CGContextRef, CGFloat))dlsym(RTLD_DEFAULT, "CGContextSetLineWidth");
+    fn_CGContextMoveToPoint         = (void (*)(CGContextRef, CGFloat, CGFloat))dlsym(RTLD_DEFAULT, "CGContextMoveToPoint");
+    fn_CGContextAddLineToPoint      = (void (*)(CGContextRef, CGFloat, CGFloat))dlsym(RTLD_DEFAULT, "CGContextAddLineToPoint");
+    fn_CGContextStrokePath          = (void (*)(CGContextRef))dlsym(RTLD_DEFAULT, "CGContextStrokePath");
+    fn_CGContextAddArc              = (void (*)(CGContextRef, CGFloat, CGFloat, CGFloat, CGFloat, CGFloat, int))dlsym(RTLD_DEFAULT, "CGContextAddArc");
+    fn_CGContextFillRect            = (void (*)(CGContextRef, CGRect))dlsym(RTLD_DEFAULT, "CGContextFillRect");
+    fn_CGContextStrokeRect          = (void (*)(CGContextRef, CGRect))dlsym(RTLD_DEFAULT, "CGContextStrokeRect");
+    fn_NSLog                        = (void (*)(id, ...))dlsym(RTLD_DEFAULT, "NSLog");
+
+    fn_objc_getClass               = (Class (*)(const char *))dlsym(RTLD_DEFAULT, "objc_getClass");
+    fn_objc_allocateClassPair       = (Class (*)(Class, const char *, size_t))dlsym(RTLD_DEFAULT, "objc_allocateClassPair");
+    fn_objc_registerClassPair       = (void (*)(Class))dlsym(RTLD_DEFAULT, "objc_registerClassPair");
+    fn_class_addMethod              = (BOOL (*)(Class, SEL, IMP, const char *))dlsym(RTLD_DEFAULT, "class_addMethod");
+    fn_objc_msgSend                 = (id (*)(id, SEL, ...))dlsym(RTLD_DEFAULT, "objc_msgSend");
+    fn_sel_registerName             = (SEL (*)(const char *))dlsym(RTLD_DEFAULT, "sel_registerName");
+    fn_object_getClass              = (Class (*)(id))dlsym(RTLD_DEFAULT, "object_getClass");
+    fn_class_getName                = (const char *(*)(Class))dlsym(RTLD_DEFAULT, "class_getName");
+}
 
 static id nsstr(const char *s) {
+    if (!fn_objc_getClass) resolve_cg_symbols();
     return ((id (*)(id, SEL, const char *))objc_msgSend)(
         (id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), s);
 }
@@ -108,9 +162,9 @@ static id nsstr(const char *s) {
 /*  Feature Configuration & Global State                              */
 /* ------------------------------------------------------------------ */
 
-#define RADAR_VIEW_SIZE    190.0f
+#define RADAR_VIEW_SIZE    180.0f
 #define MENU_WIDTH         340.0f
-#define MENU_HEIGHT        310.0f
+#define MENU_HEIGHT        320.0f
 
 static int             g_shm_fd     = -1;
 static radar_shared_t *g_shared     = NULL;
@@ -121,6 +175,8 @@ static uint32_t        g_draws = 0, g_reads = 0;
 static FILE           *g_proof = NULL;
 
 /* View references */
+static id g_button_window, g_menu_window;
+static void layout_controls(void);
 static id g_window          = nil;
 static id g_esp_view        = nil;
 static id g_radar_view      = nil;
@@ -128,16 +184,20 @@ static id g_drag_button     = nil;
 static id g_menu_view       = nil;
 static id g_menu_footer     = nil;
 
+/* Screen tracking for dynamic orientation adaptation */
+static double g_screen_w = 0.0;
+static double g_screen_h = 0.0;
+
 /* UI Rects for hit testing */
-static CGRect g_button_rect = {{16, 60}, {48, 48}};
-static CGRect g_menu_rect   = {{100, 40}, {MENU_WIDTH, MENU_HEIGHT}};
+static CGRect g_button_rect = {{16, 50}, {48, 48}};
+static CGRect g_menu_rect   = {{100, 30}, {MENU_WIDTH, MENU_HEIGHT}};
 
 /* Dragging state */
 static CGPoint g_drag_start_touch;
 static CGPoint g_drag_start_origin;
 static BOOL    g_is_dragging = NO;
 
-/* 12 Feature Flags */
+/* 12 Interactive Feature Flags */
 static BOOL g_feat_radar     = YES;
 static BOOL g_feat_lines     = YES;
 static BOOL g_feat_box       = YES;
@@ -146,6 +206,7 @@ static BOOL g_feat_name      = YES;
 static BOOL g_feat_dist      = YES;
 static BOOL g_feat_team_bot  = YES;
 static BOOL g_feat_skeleton  = YES;
+static BOOL g_feat_head      = YES;
 static BOOL g_feat_vehicles  = YES;
 static BOOL g_feat_items     = YES;
 static int  g_radar_range    = 200; /* 100, 200, 400 meters */
@@ -160,10 +221,10 @@ static id g_btn_name      = nil;
 static id g_btn_dist      = nil;
 static id g_btn_team_bot  = nil;
 static id g_btn_skeleton  = nil;
+static id g_btn_head      = nil;
 static id g_btn_vehicles  = nil;
 static id g_btn_items     = nil;
 static id g_btn_range     = nil;
-static id g_btn_pass      = nil;
 
 /* Typography & Colors cached */
 static id g_font_small = nil;
@@ -174,6 +235,7 @@ static id g_color_yellow = nil;
 static id g_color_cyan = nil;
 static id g_color_orange = nil;
 static id g_color_gold = nil;
+static id g_color_red = nil;
 
 static double monotonic_seconds(void) {
     struct timespec t;
@@ -239,6 +301,9 @@ static void update_menu_buttons(void) {
     title(g_btn_skeleton, g_feat_skeleton ? "Skeleton: ON" : "Skeleton: OFF");
     style_toggle_button(g_btn_skeleton, g_feat_skeleton);
 
+    title(g_btn_head, g_feat_head ? "Head Dot: ON" : "Head Dot: OFF");
+    style_toggle_button(g_btn_head, g_feat_head);
+
     title(g_btn_vehicles, g_feat_vehicles ? "Vehicles: ON" : "Vehicles: OFF");
     style_toggle_button(g_btn_vehicles, g_feat_vehicles);
 
@@ -250,14 +315,12 @@ static void update_menu_buttons(void) {
     title(g_btn_range, range_buf);
     style_toggle_button(g_btn_range, YES);
 
-    title(g_btn_pass, "TouchPass: 100%");
-    style_toggle_button(g_btn_pass, YES);
-
     hidden(g_radar_view, !g_feat_radar);
 }
 
 static void toggle_menu(void) {
     g_menu_open = !g_menu_open;
+    layout_controls();
     if (g_menu_view) {
         hidden(g_menu_view, !g_menu_open);
         if (g_menu_open) update_menu_buttons();
@@ -269,6 +332,24 @@ static void toggle_menu(void) {
         fprintf(g_proof, "menu_toggled open=%d\n", g_menu_open);
         fflush(g_proof);
     }
+}
+
+id get_codex_overlay_window(void) {
+    return g_window;
+}
+
+void codex_overlay_toggle_menu(void) {
+    toggle_menu();
+}
+
+static id get_shared_window(id self, SEL cmd) {
+    (void)self; (void)cmd;
+    return g_window;
+}
+
+static void codex_action_toggle_menu_cls(id self, SEL cmd) {
+    (void)self; (void)cmd;
+    toggle_menu();
 }
 
 /* ------------------------------------------------------------------ */
@@ -424,6 +505,7 @@ static void esp_drawRect(id self, SEL cmd, CGRect rect) {
     CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(self, sel_registerName("bounds"));
     double w = bounds.size.width;
     double h = bounds.size.height;
+    if (w <= 10.0 || h <= 10.0) return;
 
     /* 1. Render Players */
     uint32_t pcount = g_snapshot.header.player_count;
@@ -470,6 +552,16 @@ static void esp_drawRect(id self, SEL cmd, CGRect rect) {
             CGContextStrokeRect(ctx, CGRectMake_f(box_x, box_y, box_w, box_h));
         }
 
+        /* Feature: Head Dot Aim Marker */
+        if (g_feat_head) {
+            CGContextSetRGBStrokeColor(ctx, 1.0, 0.2, 0.2, 0.95);
+            CGContextSetRGBFillColor(ctx, 1.0, 0.2, 0.2, 0.40);
+            CGContextSetLineWidth(ctx, 1.2);
+            double hrad = fmax(3.0, box_w * 0.18);
+            CGContextFillEllipseInRect(ctx, CGRectMake_f(head_2d.x - hrad, head_2d.y - hrad, hrad * 2, hrad * 2));
+            CGContextStrokeEllipseInRect(ctx, CGRectMake_f(head_2d.x - hrad, head_2d.y - hrad, hrad * 2, hrad * 2));
+        }
+
         /* Feature: Health Bar */
         if (g_feat_health && p->health_max > 0) {
             float hp_ratio = p->health / p->health_max;
@@ -495,7 +587,9 @@ static void esp_drawRect(id self, SEL cmd, CGRect rect) {
         /* Feature: Player Name & Team/Bot Tag */
         if (g_feat_name || g_feat_team_bot) {
             char name_buf[64] = {0};
-            if (g_feat_team_bot) {
+            if (is_knocked) {
+                snprintf(name_buf, sizeof(name_buf), "[KNOCKED] %s", g_feat_name ? p->name : "");
+            } else if (g_feat_team_bot) {
                 if (p->is_bot) snprintf(name_buf, sizeof(name_buf), "[BOT] %s", g_feat_name ? p->name : "");
                 else snprintf(name_buf, sizeof(name_buf), "[T%u] %s", p->team_id, g_feat_name ? p->name : "");
             } else if (g_feat_name) {
@@ -536,7 +630,7 @@ static void esp_drawRect(id self, SEL cmd, CGRect rect) {
 
             /* Right arm: Chest(2) -> RShoulder(7) -> RElbow(8) -> RHand(9) */
             if (b_ok[2] && b_ok[7]) { CGContextMoveToPoint(ctx, b_screen[2].x, b_screen[2].y); CGContextAddLineToPoint(ctx, b_screen[7].x, b_screen[7].y); }
-            if (b_ok[7] && b_ok[8]) { CGContextMoveToPoint(ctx, b_screen[7].x, b_screen[7].y); CGContextAddLineToPoint(ctx, b_screen[8].x, b_screen[8].y); }
+            if (b_ok[7] && b_ok[8]) { CGContextMoveToPoint(ctx, b_screen[7].x, b_screen[8].y); CGContextAddLineToPoint(ctx, b_screen[8].x, b_screen[8].y); }
             if (b_ok[8] && b_ok[9]) { CGContextMoveToPoint(ctx, b_screen[8].x, b_screen[8].y); CGContextAddLineToPoint(ctx, b_screen[9].x, b_screen[9].y); }
 
             /* Left leg: Pelvis(3) -> LHip(10) -> LKnee(11) -> LFoot(12) */
@@ -593,8 +687,12 @@ static void esp_drawRect(id self, SEL cmd, CGRect rect) {
             CGPoint i_screen;
             if (!world_to_screen(item->pos, &i_screen, NULL, w, h)) continue;
 
-            /* Small dot */
-            CGContextSetRGBFillColor(ctx, 0.2, 0.95, 0.4, 0.85);
+            /* Small dot with category color */
+            if (item->category == 1) CGContextSetRGBFillColor(ctx, 1.0, 0.3, 0.3, 0.85); /* Weapons: Red */
+            else if (item->category == 2) CGContextSetRGBFillColor(ctx, 0.2, 0.7, 1.0, 0.85); /* Armor: Blue */
+            else if (item->category == 3) CGContextSetRGBFillColor(ctx, 0.2, 0.95, 0.4, 0.85); /* Meds: Green */
+            else CGContextSetRGBFillColor(ctx, 0.9, 0.9, 0.9, 0.75); /* Other / Ammo */
+
             CGContextFillEllipseInRect(ctx, CGRectMake_f(i_screen.x - 3, i_screen.y - 3, 6, 6));
 
             char ibuf[64];
@@ -763,36 +861,52 @@ static void radar_drawRect(id self, SEL cmd, CGRect rect) {
 /*  UIWindow Subclass: 100% Touch Pass-Through Window                 */
 /* ------------------------------------------------------------------ */
 
+/* Window-server routing happens before UIKit hitTest. A dedicated display
+ * class must opt out before initWithFrame registers its remote context. */
+static BOOL display_ignores_hit_test(id self, SEL cmd) {
+    (void)self; (void)cmd; return YES;
+}
+static BOOL display_uses_window_server_hit_testing(id self, SEL cmd) {
+    (void)self; (void)cmd; return NO;
+}
+
 static BOOL window_pointInside(id self, SEL cmd, CGPoint point, id event) {
-    (void)self; (void)cmd; (void)event;
-    /* 1. Inside draggable button */
-    if (in_rect(point, g_button_rect)) return YES;
-
-    /* 2. Inside open settings menu */
-    if (g_menu_open && in_rect(point, g_menu_rect)) return YES;
-
-    /* 3. Everywhere else -> PASS THROUGH 100% to game */
-    return NO;
+    (void)cmd; (void)event;
+    if (self == g_window) return NO;
+    if (self != g_button_window && self != g_menu_window) return NO;
+    if (self == g_menu_window && !g_menu_open) return NO;
+    CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(self, sel_registerName("bounds"));
+    return in_rect(point, bounds);
 }
 
 static id window_hitTest(id self, SEL cmd, CGPoint point, id event) {
     (void)cmd;
-    if (!window_pointInside(self, 0, point, event)) {
-        return nil; /* Returns nil so UIKit delivers touch directly to the game below */
-    }
+    if (!window_pointInside(self, 0, point, event)) return nil;
+    if (self == g_button_window) return g_drag_button;
+    CGPoint p = ((CGPoint (*)(id, SEL, CGPoint, id))objc_msgSend)(
+        g_menu_view, sel_registerName("convertPoint:fromView:"), point, self);
+    return ((id (*)(id, SEL, CGPoint, id))objc_msgSend)(
+        g_menu_view, sel_registerName("hitTest:withEvent:"), p, event);
+}
 
-    if (in_rect(point, g_button_rect)) {
-        return g_drag_button;
-    }
-
-    if (g_menu_open && g_menu_view && in_rect(point, g_menu_rect)) {
-        CGPoint p = (CGPoint){ point.x - g_menu_rect.origin.x, point.y - g_menu_rect.origin.y };
-        id hit = ((id (*)(id, SEL, CGPoint, id))objc_msgSend)(
-            g_menu_view, sel_registerName("hitTest:withEvent:"), p, event);
-        return hit ? hit : g_menu_view;
-    }
-
-    return nil;
+/* Only these two small windows accept input. The full-screen drawing window
+ * is noninteractive, including when the menu is expanded. */
+static void layout_controls(void) {
+    if (!g_button_window || !g_menu_window || !g_menu_view) return;
+    double margin = 32.0;
+    g_button_rect.origin.x = fmax(margin, fmin(g_button_rect.origin.x, g_screen_w - 48.0 - margin));
+    g_button_rect.origin.y = fmax(margin, fmin(g_button_rect.origin.y, g_screen_h - 48.0 - margin));
+    ((void (*)(id, SEL, CGRect))objc_msgSend)(g_button_window, sel_registerName("setFrame:"), g_button_rect);
+    ((void (*)(id, SEL, CGRect))objc_msgSend)(g_drag_button, sel_registerName("setFrame:"), CGRectMake_f(0, 0, 48, 48));
+    double scale = fmin(1.0, fmin((g_screen_w - 2 * margin) / MENU_WIDTH, (g_screen_h - 2 * margin) / MENU_HEIGHT));
+    g_menu_rect = CGRectMake_f((g_screen_w - MENU_WIDTH * scale)/2, (g_screen_h - MENU_HEIGHT * scale)/2, MENU_WIDTH * scale, MENU_HEIGHT * scale);
+    ((void (*)(id, SEL, CGRect))objc_msgSend)(g_menu_window, sel_registerName("setFrame:"), g_menu_rect);
+    typedef struct { double a,b,c,d,tx,ty; } Transform;
+    ((void (*)(id, SEL, Transform))objc_msgSend)(g_menu_view, sel_registerName("setTransform:"), (Transform){scale,0,0,scale,0,0});
+    ((void (*)(id, SEL, CGRect))objc_msgSend)(g_menu_view, sel_registerName("setBounds:"), CGRectMake_f(0,0,MENU_WIDTH,MENU_HEIGHT));
+    ((void (*)(id, SEL, CGPoint))objc_msgSend)(g_menu_view, sel_registerName("setCenter:"), (CGPoint){g_menu_rect.size.width/2,g_menu_rect.size.height/2});
+    hidden(g_menu_window, !g_menu_open);
+    hidden(g_button_window, g_menu_open);
 }
 
 /* ------------------------------------------------------------------ */
@@ -806,7 +920,8 @@ static void btn_touchesBegan(id self, SEL cmd, id touches, id event) {
         g_drag_start_touch = ((CGPoint (*)(id, SEL, id))objc_msgSend)(
             touch, sel_registerName("locationInView:"), g_window);
         CGRect f = ((CGRect (*)(id, SEL))objc_msgSend)(self, sel_registerName("frame"));
-        g_drag_start_origin = f.origin;
+        (void)f;
+        g_drag_start_origin = g_button_rect.origin;
         g_is_dragging = NO;
     }
 }
@@ -833,6 +948,7 @@ static void btn_touchesMoved(id self, SEL cmd, id touches, id event) {
             f.origin.y = new_y;
             ((void (*)(id, SEL, CGRect))objc_msgSend)(self, sel_registerName("setFrame:"), f);
             g_button_rect = f;
+            layout_controls();
         }
     }
 }
@@ -862,6 +978,7 @@ static void action_toggle_name(id self, SEL cmd, id sender)      { (void)self; (
 static void action_toggle_dist(id self, SEL cmd, id sender)      { (void)self; (void)cmd; (void)sender; g_feat_dist = !g_feat_dist; update_menu_buttons(); }
 static void action_toggle_team_bot(id self, SEL cmd, id sender)  { (void)self; (void)cmd; (void)sender; g_feat_team_bot = !g_feat_team_bot; update_menu_buttons(); }
 static void action_toggle_skeleton(id self, SEL cmd, id sender)  { (void)self; (void)cmd; (void)sender; g_feat_skeleton = !g_feat_skeleton; update_menu_buttons(); }
+static void action_toggle_head(id self, SEL cmd, id sender)      { (void)self; (void)cmd; (void)sender; g_feat_head = !g_feat_head; update_menu_buttons(); }
 static void action_toggle_vehicles(id self, SEL cmd, id sender)  { (void)self; (void)cmd; (void)sender; g_feat_vehicles = !g_feat_vehicles; update_menu_buttons(); }
 static void action_toggle_items(id self, SEL cmd, id sender)     { (void)self; (void)cmd; (void)sender; g_feat_items = !g_feat_items; update_menu_buttons(); }
 static void action_toggle_range(id self, SEL cmd, id sender) {
@@ -873,7 +990,7 @@ static void action_toggle_range(id self, SEL cmd, id sender) {
 }
 static void action_close_menu(id self, SEL cmd, id sender) {
     (void)self; (void)cmd; (void)sender;
-    toggle_menu();
+    if (g_menu_open) toggle_menu();
 }
 
 static id make_menu_button(id parent, id target, CGRect frame, const char *text, SEL action) {
@@ -893,7 +1010,7 @@ static id make_menu_button(id parent, id target, CGRect frame, const char *text,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Timer Callback: 20 Hz Frame Update                                */
+/*  Timer Callback: 20 Hz Frame Update & Orientation Adaptation        */
 /* ------------------------------------------------------------------ */
 
 static int g_frame_counter = 0;
@@ -901,6 +1018,90 @@ static int g_frame_counter = 0;
 static void timer_tick(id self, SEL cmd, id timer) {
     (void)self; (void)cmd; (void)timer;
     g_frame_counter++;
+
+    /* 1. Dynamic orientation & screen bounds adaptation */
+    id mainScreen = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIScreen"), sel_registerName("mainScreen"));
+    CGRect cur_bounds = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, sel_registerName("bounds"));
+
+    id scene = nil;
+    if (g_window) scene = ((id (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("windowScene"));
+
+    /* Periodically ensure window is attached to the foreground active UIWindowScene */
+    if (g_window && g_frame_counter % 20 == 1) {
+        id app = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
+        id scenes = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("connectedScenes"));
+        id sceneEnum = ((id (*)(id, SEL))objc_msgSend)(scenes, sel_registerName("objectEnumerator"));
+        id s, active_s = nil;
+        while ((s = ((id (*)(id, SEL))objc_msgSend)(sceneEnum, sel_registerName("nextObject")))) {
+            if (((BOOL (*)(id, SEL, Class))objc_msgSend)(s, sel_registerName("isKindOfClass:"), objc_getClass("UIWindowScene"))) {
+                NSInteger state = (NSInteger)((id (*)(id, SEL))objc_msgSend)(s, sel_registerName("activationState"));
+                if (state == 0) { /* UISceneActivationStateForegroundActive */
+                    active_s = s;
+                    break;
+                }
+                if (!active_s) active_s = s;
+            }
+        }
+        if (active_s && active_s != scene) {
+            ((void (*)(id, SEL, id))objc_msgSend)(g_window, sel_registerName("setWindowScene:"), active_s);
+            ((void (*)(id, SEL, id))objc_msgSend)(g_button_window, sel_registerName("setWindowScene:"), active_s);
+            ((void (*)(id, SEL, id))objc_msgSend)(g_menu_window, sel_registerName("setWindowScene:"), active_s);
+            scene = active_s;
+        }
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(g_window, sel_registerName("setHidden:"), NO);
+        if (!g_menu_open && g_button_window) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(g_button_window, sel_registerName("setHidden:"), NO);
+        }
+    }
+    NSInteger ori = 0;
+    if (scene) ori = (NSInteger)((id (*)(id, SEL))objc_msgSend)(scene, sel_registerName("interfaceOrientation"));
+    BOOL is_landscape = (ori == 3 || ori == 4);
+    if (!is_landscape && g_snapshot.header.status == 2 && g_snapshot.header.camera_valid) {
+        /* When live game camera is tracking, PUBG Mobile on iPhone is landscape */
+        is_landscape = YES;
+    }
+    if (is_landscape) {
+        double sw = fmax(cur_bounds.size.width, cur_bounds.size.height);
+        double sh = fmin(cur_bounds.size.width, cur_bounds.size.height);
+        cur_bounds = CGRectMake_f(0, 0, sw, sh);
+    } else {
+        double sw = fmin(cur_bounds.size.width, cur_bounds.size.height);
+        double sh = fmax(cur_bounds.size.width, cur_bounds.size.height);
+        cur_bounds = CGRectMake_f(0, 0, sw, sh);
+    }
+
+    if (cur_bounds.size.width > 0 && cur_bounds.size.height > 0 &&
+        (fabs(cur_bounds.size.width - g_screen_w) > 1.0 || fabs(cur_bounds.size.height - g_screen_h) > 1.0)) {
+        g_screen_w = cur_bounds.size.width;
+        g_screen_h = cur_bounds.size.height;
+
+        if (g_window) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_window, sel_registerName("setFrame:"), cur_bounds);
+        if (g_esp_view) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_esp_view, sel_registerName("setFrame:"), cur_bounds);
+
+        /* Adapt radar position for Landscape vs Portrait */
+        double rx = fmax(10.0, g_screen_w - RADAR_VIEW_SIZE - 32.0);
+        double ry = (g_screen_w > g_screen_h) ? 32.0 : 50.0;
+        if (g_radar_view) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_radar_view, sel_registerName("setFrame:"),
+                                                                    CGRectMake_f(rx, ry, RADAR_VIEW_SIZE, RADAR_VIEW_SIZE));
+
+        /* Adapt settings menu position (centered on screen) */
+        double mx = fmax(10.0, (g_screen_w - MENU_WIDTH) / 2.0);
+        double my = fmax(10.0, (g_screen_h - MENU_HEIGHT) / 2.0);
+        g_menu_rect = CGRectMake_f(mx, my, MENU_WIDTH, MENU_HEIGHT);
+        if (g_menu_view) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_menu_view, sel_registerName("setFrame:"), g_menu_rect);
+
+        /* Clamp floating button within new screen boundaries */
+        if (g_drag_button) {
+            CGRect bf = g_button_rect;
+            if (bf.origin.x + bf.size.width > g_screen_w - 4.0) bf.origin.x = g_screen_w - bf.size.width - 4.0;
+            if (bf.origin.y + bf.size.height > g_screen_h - 4.0) bf.origin.y = g_screen_h - bf.size.height - 4.0;
+            if (bf.origin.x < 4.0) bf.origin.x = 4.0;
+            if (bf.origin.y < 4.0) bf.origin.y = 4.0;
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(g_drag_button, sel_registerName("setFrame:"), bf);
+            g_button_rect = bf;
+            layout_controls();
+        }
+    }
 
     if (!g_shared && g_frame_counter % 20 == 1) {
         open_shared_memory();
@@ -941,12 +1142,36 @@ static void timer_tick(id self, SEL cmd, id timer) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/*  Tweak Initialization                                              */
-/* ------------------------------------------------------------------ */
+/* --- Root View Controller with Full Orientation Support --- */
+static NSUInteger vc_supportedOrientations(id self, SEL cmd) {
+    (void)self; (void)cmd;
+    return 30; /* UIInterfaceOrientationMaskAll */
+}
+static BOOL vc_shouldAutorotate(id self, SEL cmd) {
+    (void)self; (void)cmd;
+    return YES;
+}
+static BOOL vc_prefersStatusBarHidden(id self, SEL cmd) {
+    (void)self; (void)cmd;
+    return YES;
+}
+static void vc_loadView(id self, SEL cmd) {
+    (void)cmd;
+    Class UIView_cls = objc_getClass("UIView");
+    Class UIScreen_cls = objc_getClass("UIScreen");
+    id mainScreen = ((id (*)(id, SEL))objc_msgSend)((id)UIScreen_cls, sel_registerName("mainScreen"));
+    CGRect b = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, sel_registerName("bounds"));
+    id v = ((id (*)(id, SEL, CGRect))objc_msgSend)(
+        ((id (*)(id, SEL))objc_msgSend)((id)UIView_cls, sel_registerName("alloc")),
+        sel_registerName("initWithFrame:"), b);
+    ((void (*)(id, SEL, id))objc_msgSend)(self, sel_registerName("setView:"), v);
+}
 
 static void init_overlay(void) {
     if (g_window) return;
+    FILE *fstep = fopen("/var/mobile/Downloads/overlay_step.log", "w");
+    if (fstep) { fprintf(fstep, "step 1: resolve_cg_symbols\n"); fflush(fstep); }
+    resolve_cg_symbols();
     g_proof = fopen("/var/mobile/Downloads/ue4_overlay_v3_proof.log", "a");
 
     Class UIWindow_cls  = objc_getClass("UIWindow");
@@ -961,20 +1186,77 @@ static void init_overlay(void) {
     Class NSTimer_cls   = objc_getClass("NSTimer");
     Class NSRunLoop_cls = objc_getClass("NSRunLoop");
 
+    if (!UIApp_cls || !UIWindowScene || !UIWindow_cls) {
+        if (fstep) { fprintf(fstep, "Essential classes not available yet\n"); fclose(fstep); }
+        return;
+    }
+
+    id app = ((id (*)(id, SEL))objc_msgSend)((id)UIApp_cls, sel_registerName("sharedApplication"));
+    if (!app) {
+        if (fstep) { fprintf(fstep, "sharedApplication is nil\n"); fclose(fstep); }
+        return;
+    }
+
+    id scenes = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("connectedScenes"));
+    if (!scenes) {
+        if (fstep) { fprintf(fstep, "connectedScenes is nil\n"); fclose(fstep); }
+        return;
+    }
+
+    id sceneEnum = ((id (*)(id, SEL))objc_msgSend)(scenes, sel_registerName("objectEnumerator"));
+    id scene = nil, best_scene = nil;
+    while ((scene = ((id (*)(id, SEL))objc_msgSend)(sceneEnum, sel_registerName("nextObject")))) {
+        BOOL isWindowScene = (BOOL)(NSInteger)((id (*)(id, SEL, id))objc_msgSend)(
+            scene, sel_registerName("isKindOfClass:"), UIWindowScene);
+        if (isWindowScene) {
+            NSInteger state = (NSInteger)((id (*)(id, SEL))objc_msgSend)(scene, sel_registerName("activationState"));
+            if (state == 0) { // UISceneActivationStateForegroundActive
+                best_scene = scene;
+                break;
+            }
+            if (!best_scene) best_scene = scene;
+        }
+    }
+    if (!best_scene) {
+        if (fstep) { fprintf(fstep, "No UIWindowScene connected yet, waiting...\n"); fclose(fstep); }
+        return;
+    }
+
+    if (fstep) {
+        fprintf(fstep, "step 2: active UIWindowScene=%p, UIWindow=%p, UIView=%p, UIButton=%p, UILabel=%p, UIScreen=%p, UIColor=%p, UIFont=%p\n",
+                best_scene, UIWindow_cls, UIView_cls, UIButton_cls, UILabel_cls, UIScreen_cls, UIColor_cls, UIFont_cls);
+        fflush(fstep);
+    }
+
     /* Cache common colors and fonts */
-    g_font_small   = ((id (*)(id, SEL, double))objc_msgSend)((id)UIFont_cls, sel_registerName("systemFontOfSize:"), 11.0);
-    g_font_bold    = ((id (*)(id, SEL, double))objc_msgSend)((id)UIFont_cls, sel_registerName("boldSystemFontOfSize:"), 12.0);
-    g_color_white  = ((id (*)(id, SEL))objc_msgSend)((id)UIColor_cls, sel_registerName("whiteColor"));
-    g_color_green  = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-        (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 0.2, 0.95, 0.35, 1.0);
-    g_color_yellow = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-        (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.9, 0.2, 1.0);
-    g_color_cyan   = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-        (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 0.0, 0.88, 1.0, 1.0);
-    g_color_orange = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-        (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.55, 0.0, 1.0);
-    g_color_gold   = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-        (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.82, 0.1, 1.0);
+    if (fstep) { fprintf(fstep, "step 2a: fonts\n"); fflush(fstep); }
+    if (UIFont_cls) {
+        g_font_small = ((id (*)(id, SEL, double))objc_msgSend)((id)UIFont_cls, sel_registerName("systemFontOfSize:"), 11.0);
+        g_font_bold  = ((id (*)(id, SEL, double))objc_msgSend)((id)UIFont_cls, sel_registerName("boldSystemFontOfSize:"), 12.0);
+    }
+    if (fstep) { fprintf(fstep, "step 2b: white\n"); fflush(fstep); }
+    if (UIColor_cls) {
+        g_color_white = ((id (*)(id, SEL))objc_msgSend)((id)UIColor_cls, sel_registerName("whiteColor"));
+        if (fstep) { fprintf(fstep, "step 2c: green\n"); fflush(fstep); }
+        g_color_green = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 0.2, 0.95, 0.35, 1.0);
+        if (fstep) { fprintf(fstep, "step 2d: yellow\n"); fflush(fstep); }
+        g_color_yellow = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.9, 0.2, 1.0);
+        if (fstep) { fprintf(fstep, "step 2e: cyan\n"); fflush(fstep); }
+        g_color_cyan = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 0.0, 0.88, 1.0, 1.0);
+        if (fstep) { fprintf(fstep, "step 2f: orange\n"); fflush(fstep); }
+        g_color_orange = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.55, 0.0, 1.0);
+        if (fstep) { fprintf(fstep, "step 2g: gold\n"); fflush(fstep); }
+        g_color_gold = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.82, 0.1, 1.0);
+        if (fstep) { fprintf(fstep, "step 2h: red\n"); fflush(fstep); }
+        g_color_red = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.2, 0.2, 1.0);
+    }
+    if (fstep) { fprintf(fstep, "step 3: custom classes\n"); fflush(fstep); }
 
     /* --- Register Custom Classes --- */
 
@@ -988,6 +1270,20 @@ static void init_overlay(void) {
         class_addMethod(RadarWindow, sel_registerName("hitTest:withEvent:"),
                         (IMP)window_hitTest, "@@:{CGPoint=dd}@");
         objc_registerClassPair(RadarWindow);
+    }
+    Class DisplayWindow = objc_allocateClassPair(RadarWindow, "CodexNoninteractiveDisplayWindow", 0);
+    if (!DisplayWindow) DisplayWindow = objc_getClass("CodexNoninteractiveDisplayWindow");
+    else {
+        class_addMethod(DisplayWindow, sel_registerName("_ignoresHitTest"),
+                        (IMP)display_ignores_hit_test, "B@:");
+        class_addMethod(DisplayWindow, sel_registerName("_usesWindowServerHitTesting"),
+                        (IMP)display_uses_window_server_hit_testing, "B@:");
+        objc_registerClassPair(DisplayWindow);
+    }
+    Class metaW = object_getClass((id)RadarWindow);
+    if (metaW) {
+        class_addMethod(metaW, sel_registerName("sharedWindow"), (IMP)get_shared_window, "@@:");
+        class_addMethod(metaW, sel_registerName("toggleMenu"), (IMP)codex_action_toggle_menu_cls, "v@:");
     }
 
     /* 2. ESP Fullscreen View */
@@ -1036,11 +1332,17 @@ static void init_overlay(void) {
         class_addMethod(ActionHelper, sel_registerName("toggleDist:"), (IMP)action_toggle_dist, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("toggleTeam:"), (IMP)action_toggle_team_bot, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("toggleSkeleton:"), (IMP)action_toggle_skeleton, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleHead:"), (IMP)action_toggle_head, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("toggleVehicles:"), (IMP)action_toggle_vehicles, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("toggleItems:"), (IMP)action_toggle_items, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("toggleRange:"), (IMP)action_toggle_range, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("closeMenu:"), (IMP)action_close_menu, "v@:@");
         objc_registerClassPair(ActionHelper);
+    }
+    Class metaH = object_getClass((id)ActionHelper);
+    if (metaH) {
+        class_addMethod(metaH, sel_registerName("sharedWindow"), (IMP)get_shared_window, "@@:");
+        class_addMethod(metaH, sel_registerName("toggleMenu"), (IMP)codex_action_toggle_menu_cls, "v@:");
     }
 
     id helper = ((id (*)(id, SEL))objc_msgSend)(
@@ -1050,9 +1352,11 @@ static void init_overlay(void) {
     /* --- Screen & Window Setup --- */
     id mainScreen = ((id (*)(id, SEL))objc_msgSend)((id)UIScreen_cls, sel_registerName("mainScreen"));
     CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, sel_registerName("bounds"));
+    g_screen_w = bounds.size.width;
+    g_screen_h = bounds.size.height;
 
     id window = ((id (*)(id, SEL, CGRect))objc_msgSend)(
-        ((id (*)(id, SEL))objc_msgSend)((id)RadarWindow, sel_registerName("alloc")),
+        ((id (*)(id, SEL))objc_msgSend)((id)DisplayWindow, sel_registerName("alloc")),
         sel_registerName("initWithFrame:"), bounds);
     g_window = window;
 
@@ -1060,29 +1364,44 @@ static void init_overlay(void) {
     ((void (*)(id, SEL, double))objc_msgSend)(window, sel_registerName("setWindowLevel:"), 10000001.0);
     id clearColor = ((id (*)(id, SEL))objc_msgSend)((id)UIColor_cls, sel_registerName("clearColor"));
     ((void (*)(id, SEL, id))objc_msgSend)(window, sel_registerName("setBackgroundColor:"), clearColor);
-    ((void (*)(id, SEL, BOOL))objc_msgSend)(window, sel_registerName("setUserInteractionEnabled:"), YES);
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(window, sel_registerName("setUserInteractionEnabled:"), NO);
 
-    /* Root View Controller */
+    /* Root View Controller with Full Orientation Support */
+    Class CodexOverlayVC = objc_allocateClassPair(objc_getClass("UIViewController"), "CodexOverlayViewController", 0);
+    if (!CodexOverlayVC) {
+        CodexOverlayVC = objc_getClass("CodexOverlayViewController");
+    } else {
+        class_addMethod(CodexOverlayVC, sel_registerName("supportedInterfaceOrientations"), (IMP)vc_supportedOrientations, "Q@:");
+        class_addMethod(CodexOverlayVC, sel_registerName("shouldAutorotate"), (IMP)vc_shouldAutorotate, "B@:");
+        class_addMethod(CodexOverlayVC, sel_registerName("prefersStatusBarHidden"), (IMP)vc_prefersStatusBarHidden, "B@:");
+        class_addMethod(CodexOverlayVC, sel_registerName("loadView"), (IMP)vc_loadView, "v@:");
+        objc_registerClassPair(CodexOverlayVC);
+    }
+
     id controller = ((id (*)(id, SEL))objc_msgSend)(
-        ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIViewController"), sel_registerName("alloc")),
+        ((id (*)(id, SEL))objc_msgSend)((id)CodexOverlayVC, sel_registerName("alloc")),
         sel_registerName("init"));
     ((void (*)(id, SEL, id))objc_msgSend)(window, sel_registerName("setRootViewController:"), controller);
     id root_view = ((id (*)(id, SEL))objc_msgSend)(controller, sel_registerName("view"));
     ((void (*)(id, SEL, id))objc_msgSend)(root_view, sel_registerName("setBackgroundColor:"), clearColor);
     ((void (*)(id, SEL, BOOL))objc_msgSend)(root_view, sel_registerName("setUserInteractionEnabled:"), NO);
 
-    /* Attach Window Scene */
-    id app = ((id (*)(id, SEL))objc_msgSend)((id)UIApp_cls, sel_registerName("sharedApplication"));
-    id scenes = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("connectedScenes"));
-    id sceneEnum = ((id (*)(id, SEL))objc_msgSend)(scenes, sel_registerName("objectEnumerator"));
-    id scene;
-    while ((scene = ((id (*)(id, SEL))objc_msgSend)(sceneEnum, sel_registerName("nextObject")))) {
-        BOOL isWindowScene = (BOOL)(NSInteger)((id (*)(id, SEL, id))objc_msgSend)(
-            scene, sel_registerName("isKindOfClass:"), UIWindowScene);
-        if (isWindowScene) {
-            ((id (*)(id, SEL, id))objc_msgSend)(window, sel_registerName("setWindowScene:"), scene);
-            break;
-        }
+    /* Attach verified active Window Scene */
+    ((void (*)(id, SEL, id))objc_msgSend)(window, sel_registerName("setWindowScene:"), best_scene);
+
+    id *controls[] = { &g_button_window, &g_menu_window };
+    for (int i = 0; i < 2; ++i) {
+        id w = ((id (*)(id, SEL, CGRect))objc_msgSend)(
+            ((id (*)(id, SEL))objc_msgSend)((id)RadarWindow, sel_registerName("alloc")),
+            sel_registerName("initWithFrame:"), CGRectMake_f(0,0,48,48));
+        *controls[i] = w;
+        ((void (*)(id, SEL, id))objc_msgSend)(w, sel_registerName("setWindowScene:"), best_scene);
+        ((void (*)(id, SEL, double))objc_msgSend)(w, sel_registerName("setWindowLevel:"), 10000002.0 + i);
+        ((void (*)(id, SEL, id))objc_msgSend)(w, sel_registerName("setBackgroundColor:"), clearColor);
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(w, sel_registerName("setUserInteractionEnabled:"), YES);
+        id vc = ((id (*)(id, SEL))objc_msgSend)(
+            ((id (*)(id, SEL))objc_msgSend)((id)CodexOverlayVC, sel_registerName("alloc")), sel_registerName("init"));
+        ((void (*)(id, SEL, id))objc_msgSend)(w, sel_registerName("setRootViewController:"), vc);
     }
 
     /* --- Subview 1: Fullscreen ESP View --- */
@@ -1096,8 +1415,8 @@ static void init_overlay(void) {
     g_esp_view = esp;
 
     /* --- Subview 2: Radar Minimap View (Top-Right) --- */
-    double rx = fmax(10.0, bounds.size.width - RADAR_VIEW_SIZE - 12.0);
-    double ry = 12.0;
+    double rx = fmax(10.0, bounds.size.width - RADAR_VIEW_SIZE - 32.0);
+    double ry = (bounds.size.width > bounds.size.height) ? 32.0 : 50.0;
     id radar = ((id (*)(id, SEL, CGRect))objc_msgSend)(
         ((id (*)(id, SEL))objc_msgSend)((id)RadarView, sel_registerName("alloc")),
         sel_registerName("initWithFrame:"), CGRectMake_f(rx, ry, RADAR_VIEW_SIZE, RADAR_VIEW_SIZE));
@@ -1127,7 +1446,7 @@ static void init_overlay(void) {
         ((void (*)(id, SEL, double))objc_msgSend)(btn_layer, sel_registerName("setBorderWidth:"), 2.0);
         ((void (*)(id, SEL, double))objc_msgSend)(btn_layer, sel_registerName("setCornerRadius:"), 24.0);
     }
-    ((void (*)(id, SEL, id))objc_msgSend)(window, sel_registerName("addSubview:"), drag_btn);
+    ((void (*)(id, SEL, id))objc_msgSend)(g_button_window, sel_registerName("addSubview:"), drag_btn);
     g_drag_button = drag_btn;
 
     /* --- Subview 4: Settings Menu Card (Centered) --- */
@@ -1153,19 +1472,19 @@ static void init_overlay(void) {
     /* Menu Title Header */
     id title_label = ((id (*)(id, SEL, CGRect))objc_msgSend)(
         ((id (*)(id, SEL))objc_msgSend)((id)UILabel_cls, sel_registerName("alloc")),
-        sel_registerName("initWithFrame:"), CGRectMake_f(14.0, 8.0, 240.0, 26.0));
+        sel_registerName("initWithFrame:"), CGRectMake_f(14.0, 8.0, 208.0, 26.0));
     ((void (*)(id, SEL, id))objc_msgSend)(title_label, sel_registerName("setText:"), nsstr("UE4 RADAR & ESP MENU"));
     ((void (*)(id, SEL, id))objc_msgSend)(title_label, sel_registerName("setTextColor:"), g_color_cyan);
     if (g_font_bold) ((void (*)(id, SEL, id))objc_msgSend)(title_label, sel_registerName("setFont:"), g_font_bold);
     ((void (*)(id, SEL, id))objc_msgSend)(menu, sel_registerName("addSubview:"), title_label);
 
     /* Close Button [ X ] */
-    id close_btn = make_menu_button(menu, helper, CGRectMake_f(MENU_WIDTH - 42.0, 8.0, 32.0, 26.0), "X", sel_registerName("closeMenu:"));
+    id close_btn = make_menu_button(menu, helper, CGRectMake_f(MENU_WIDTH - 108.0, 2.0, 98.0, 36.0), "Collapse", sel_registerName("closeMenu:"));
     style_toggle_button(close_btn, NO);
 
     /* 2-Column Grid of 12 Feature Buttons */
     double c0 = 12.0, c1 = 176.0, bw = 152.0, bh = 34.0;
-    double r0 = 42.0, r1 = 82.0, r2 = 122.0, r3 = 162.0, r4 = 202.0, r5 = 242.0;
+    double r0 = 40.0, r1 = 80.0, r2 = 120.0, r3 = 160.0, r4 = 200.0, r5 = 240.0;
 
     g_btn_radar    = make_menu_button(menu, helper, CGRectMake_f(c0, r0, bw, bh), "Radar: ON",    sel_registerName("toggleRadar:"));
     g_btn_lines    = make_menu_button(menu, helper, CGRectMake_f(c1, r0, bw, bh), "Snaplines: ON",sel_registerName("toggleLines:"));
@@ -1175,31 +1494,31 @@ static void init_overlay(void) {
     g_btn_dist     = make_menu_button(menu, helper, CGRectMake_f(c1, r2, bw, bh), "Distance: ON", sel_registerName("toggleDist:"));
     g_btn_team_bot = make_menu_button(menu, helper, CGRectMake_f(c0, r3, bw, bh), "Team/Bot: ON", sel_registerName("toggleTeam:"));
     g_btn_skeleton = make_menu_button(menu, helper, CGRectMake_f(c1, r3, bw, bh), "Skeleton: ON", sel_registerName("toggleSkeleton:"));
-    g_btn_vehicles = make_menu_button(menu, helper, CGRectMake_f(c0, r4, bw, bh), "Vehicles: ON", sel_registerName("toggleVehicles:"));
-    g_btn_items    = make_menu_button(menu, helper, CGRectMake_f(c1, r4, bw, bh), "Loot ESP: ON", sel_registerName("toggleItems:"));
-    g_btn_range    = make_menu_button(menu, helper, CGRectMake_f(c0, r5, bw, bh), "Range: 200m",  sel_registerName("toggleRange:"));
-    g_btn_pass     = make_menu_button(menu, helper, CGRectMake_f(c1, r5, bw, bh), "TouchPass: 100%", sel_registerName("closeMenu:"));
+    g_btn_head     = make_menu_button(menu, helper, CGRectMake_f(c0, r4, bw, bh), "Head Dot: ON", sel_registerName("toggleHead:"));
+    g_btn_vehicles = make_menu_button(menu, helper, CGRectMake_f(c1, r4, bw, bh), "Vehicles: ON", sel_registerName("toggleVehicles:"));
+    g_btn_items    = make_menu_button(menu, helper, CGRectMake_f(c0, r5, bw, bh), "Loot ESP: ON", sel_registerName("toggleItems:"));
+    g_btn_range    = make_menu_button(menu, helper, CGRectMake_f(c1, r5, bw, bh), "Range: 200m",  sel_registerName("toggleRange:"));
 
     /* Footer Telemetry Label */
     id footer = ((id (*)(id, SEL, CGRect))objc_msgSend)(
         ((id (*)(id, SEL))objc_msgSend)((id)UILabel_cls, sel_registerName("alloc")),
-        sel_registerName("initWithFrame:"), CGRectMake_f(12.0, 280.0, MENU_WIDTH - 24.0, 20.0));
-    ((void (*)(id, SEL, id))objc_msgSend)(footer, sel_registerName("setText:"), nsstr("Status: READY | 100% Touch Passthrough"));
+        sel_registerName("initWithFrame:"), CGRectMake_f(12.0, 285.0, MENU_WIDTH - 24.0, 24.0));
+    ((void (*)(id, SEL, id))objc_msgSend)(footer, sel_registerName("setText:"), nsstr("Tap Collapse to return to the game"));
     ((void (*)(id, SEL, id))objc_msgSend)(footer, sel_registerName("setTextColor:"), g_color_white);
     if (g_font_small) ((void (*)(id, SEL, id))objc_msgSend)(footer, sel_registerName("setFont:"), g_font_small);
     ((void (*)(id, SEL, id))objc_msgSend)(menu, sel_registerName("addSubview:"), footer);
     g_menu_footer = footer;
 
-    ((void (*)(id, SEL, id))objc_msgSend)(window, sel_registerName("addSubview:"), menu);
+    ((void (*)(id, SEL, id))objc_msgSend)(g_menu_window, sel_registerName("addSubview:"), menu);
     g_menu_view = menu;
     hidden(menu, YES); /* Closed by default */
+    layout_controls();
     update_menu_buttons();
 
     /* Make window visible */
     ((void (*)(id, SEL, BOOL))objc_msgSend)(window, sel_registerName("setHidden:"), NO);
 
     /* --- Built-in Selftest --- */
-    /* Verify button actions, toggles, and pass-through */
     toggle_menu(); /* Open */
     BOOL test_menu_open = g_menu_open;
 
@@ -1211,7 +1530,16 @@ static void init_overlay(void) {
     BOOL test_lines_toggle = !g_feat_lines;
     ((void (*)(id, SEL, NSUInteger))objc_msgSend)(g_btn_lines, sel_registerName("sendActionsForControlEvents:"), 64); /* restore */
 
-    toggle_menu(); /* Close */
+    CGPoint close_center = {MENU_WIDTH - 59, 20};
+    CGPoint close_in_window = ((CGPoint (*)(id, SEL, CGPoint, id))objc_msgSend)(g_menu_view,
+        sel_registerName("convertPoint:toView:"), close_center, g_menu_window);
+    BOOL test_close_hit = window_hitTest(g_menu_window, 0, close_in_window, nil) == close_btn;
+    ((void (*)(id, SEL, NSUInteger))objc_msgSend)(close_btn, sel_registerName("sendActionsForControlEvents:"), 64);
+    BOOL test_collapsed = !g_menu_open && ((BOOL (*)(id, SEL))objc_msgSend)(g_menu_window, sel_registerName("isHidden"));
+    ((void (*)(id, SEL, NSUInteger))objc_msgSend)(close_btn, sel_registerName("sendActionsForControlEvents:"), 64);
+    test_collapsed = test_collapsed && !g_menu_open;
+    if (g_proof) fprintf(g_proof, "CONTROLS close_hit=%d collapse_idempotent=%d button_hit=%d\n", test_close_hit, test_collapsed,
+        window_hitTest(g_button_window,0,(CGPoint){24,24},nil) == g_drag_button);
     BOOL test_pass_corner = !window_pointInside(window, 0, (CGPoint){2, 2}, nil);
     BOOL test_pass_radar  = !window_pointInside(window, 0, (CGPoint){rx + 50, ry + 50}, nil);
 
@@ -1221,6 +1549,20 @@ static void init_overlay(void) {
         fflush(g_proof);
     }
 
+    if (g_proof) {
+        CGRect bf = ((CGRect (*)(id, SEL))objc_msgSend)(g_button_window, sel_registerName("frame"));
+        CGRect mf = ((CGRect (*)(id, SEL))objc_msgSend)(g_menu_window, sel_registerName("frame"));
+        fprintf(g_proof, "BUILD server-passthrough-20260913 button=(%.0f,%.0f %.0fx%.0f) menu=(%.0f,%.0f %.0fx%.0f) display_interactive=%d\n", bf.origin.x,bf.origin.y,bf.size.width,bf.size.height,mf.origin.x,mf.origin.y,mf.size.width,mf.size.height,
+            ((BOOL (*)(id, SEL))objc_msgSend)(g_window,sel_registerName("isUserInteractionEnabled")));
+        fflush(g_proof);
+    }
+
+    if (g_proof) {
+        fprintf(g_proof, "SERVER_TOUCH ignores=%d server_hit_testing=%d\n",
+            ((BOOL (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("_ignoresHitTest")),
+            ((BOOL (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("_usesWindowServerHitTesting")));
+        fflush(g_proof);
+    }
     /* Open shared memory */
     open_shared_memory();
 
@@ -1229,11 +1571,13 @@ static void init_overlay(void) {
         (id)NSTimer_cls, sel_registerName("timerWithTimeInterval:target:selector:userInfo:repeats:"),
         0.05, helper, sel_registerName("tick:"), nil, YES);
 
-    id runloop = ((id (*)(id, SEL))objc_msgSend)((id)NSRunLoop_cls, sel_registerName("currentRunLoop"));
+    id runloop = ((id (*)(id, SEL))objc_msgSend)((id)NSRunLoop_cls, sel_registerName("mainRunLoop"));
     id mode = nsstr("kCFRunLoopCommonModes");
     ((void (*)(id, SEL, id, id))objc_msgSend)(runloop, sel_registerName("addTimer:forMode:"), timer, mode);
-
-    NSLog(nsstr("[Radar] Overlay initialized with full 12-feature menu and complete touch pass-through"));
+    if (g_proof) {
+        fprintf(g_proof, "[Radar] Overlay initialized with full 12-feature menu, separate bounded control windows and fitted Collapse menu\n");
+        fflush(g_proof);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1241,17 +1585,38 @@ static void init_overlay(void) {
 /* ------------------------------------------------------------------ */
 
 static void deferred_init(id self, SEL cmd) {
-    (void)self; (void)cmd;
+    (void)cmd;
+    if (g_window) return;
     init_overlay();
+    if (!g_window && self) {
+        /* Retry after 0.5s if SpringBoard scenes were not connected yet */
+        ((void (*)(id, SEL, SEL, id, double))objc_msgSend)(
+            self, sel_registerName("performSelector:withObject:afterDelay:"),
+            sel_registerName("deferredInit"), nil, 0.5);
+    }
 }
 
 __attribute__((constructor))
 static void tweak_entry(void) {
+    resolve_cg_symbols();
+
+    /* Ensure we only run inside SpringBoard */
+    Class NSProcessInfo_cls = objc_getClass("NSProcessInfo");
+    if (NSProcessInfo_cls) {
+        id procInfo = ((id (*)(id, SEL))objc_msgSend)((id)NSProcessInfo_cls, sel_registerName("processInfo"));
+        id procName = ((id (*)(id, SEL))objc_msgSend)(procInfo, sel_registerName("processName"));
+        const char *pname = ((const char *(*)(id, SEL))objc_msgSend)(procName, sel_registerName("UTF8String"));
+        if (pname && strcmp(pname, "SpringBoard") != 0 && strstr(pname, "test_dlopen") == NULL && strstr(pname, "menu_runtime_test") == NULL) {
+            return;
+        }
+    }
+
     Class Helper = objc_allocateClassPair(objc_getClass("NSObject"), "CodexRadarV4Init", 0);
     if (!Helper) {
         Helper = objc_getClass("CodexRadarV4Init");
     } else {
         class_addMethod(Helper, sel_registerName("deferredInit"), (IMP)deferred_init, "v@:");
+        class_addMethod(Helper, sel_registerName("deferredInit:"), (IMP)deferred_init, "v@:@");
         objc_registerClassPair(Helper);
     }
 
@@ -1259,7 +1624,34 @@ static void tweak_entry(void) {
         ((id (*)(id, SEL))objc_msgSend)((id)Helper, sel_registerName("alloc")),
         sel_registerName("init"));
 
-    ((void (*)(id, SEL, SEL, id, BOOL))objc_msgSend)(
-        helper, sel_registerName("performSelectorOnMainThread:withObject:waitUntilDone:"),
-        sel_registerName("deferredInit"), nil, NO);
+    Class NSThread_cls = objc_getClass("NSThread");
+
+    /* Register notification observers for app launch and scene activation as fallbacks */
+    Class NSNotificationCenter_cls = objc_getClass("NSNotificationCenter");
+    if (NSNotificationCenter_cls) {
+        id center = ((id (*)(id, SEL))objc_msgSend)((id)NSNotificationCenter_cls, sel_registerName("defaultCenter"));
+        if (center) {
+            id notif1 = nsstr("UIApplicationDidFinishLaunchingNotification");
+            id notif2 = nsstr("UISceneDidActivateNotification");
+            id notif3 = nsstr("UISceneWillConnectNotification");
+            ((void (*)(id, SEL, id, SEL, id, id))objc_msgSend)(
+                center, sel_registerName("addObserver:selector:name:object:"),
+                helper, sel_registerName("deferredInit:"), notif1, nil);
+            ((void (*)(id, SEL, id, SEL, id, id))objc_msgSend)(
+                center, sel_registerName("addObserver:selector:name:object:"),
+                helper, sel_registerName("deferredInit:"), notif2, nil);
+            ((void (*)(id, SEL, id, SEL, id, id))objc_msgSend)(
+                center, sel_registerName("addObserver:selector:name:object:"),
+                helper, sel_registerName("deferredInit:"), notif3, nil);
+        }
+    }
+
+    /* Unconditionally dispatch to main thread */
+    if (NSThread_cls && ((BOOL (*)(id, SEL))objc_msgSend)((id)NSThread_cls, sel_registerName("isMainThread"))) {
+        deferred_init(helper, sel_registerName("deferredInit"));
+    } else {
+        ((void (*)(id, SEL, SEL, id, BOOL))objc_msgSend)(
+            helper, sel_registerName("performSelectorOnMainThread:withObject:waitUntilDone:"),
+            sel_registerName("deferredInit"), nil, NO);
+    }
 }

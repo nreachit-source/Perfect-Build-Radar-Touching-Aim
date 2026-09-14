@@ -1,5 +1,5 @@
 /*
- * radar_reader.c — Live read-only radar & ESP engine.
+ * radar_reader.c — High-performance live read-only radar & ESP telemetry engine.
  *
  * Reads UE4 reflection structures and game state from the target game
  * process (ShadowTrackerExtra) and publishes live telemetry to a shared
@@ -28,9 +28,30 @@ static radar_shared_t *shared;
 static radar_shared_t frame;
 static int fd = -1;
 static FILE *logfile;
+static double started_at;
+static bool first_live;
 static uint32_t tick, last_status = UINT32_MAX;
 static double next_lookup;
 static int32_t world_cursor;
+
+/* Fast Class Cache: resolves each UClass* at most once */
+#define CLASS_CACHE_SIZE 1024
+typedef enum {
+    CLS_UNKNOWN = 0,
+    CLS_IGNORE,
+    CLS_PLAYER,
+    CLS_VEHICLE,
+    CLS_ITEM
+} cls_type_t;
+
+typedef struct {
+    uint64_t   class_ptr;
+    cls_type_t type;
+    char       name[32];
+} class_cache_entry_t;
+
+static class_cache_entry_t g_classes[CLASS_CACHE_SIZE];
+static uint32_t           g_class_count = 0;
 
 /* Cached candidate actor pointers */
 static uint64_t characters[512];
@@ -39,11 +60,7 @@ static uint64_t vehicles[64];
 static unsigned vehicle_count;
 static uint64_t items[256];
 static unsigned item_count;
-
-static int32_t char_cursor;
-static int32_t veh_cursor;
-static int32_t item_cursor;
-static double next_scan_time;
+static double   next_scan_time;
 
 static double now_seconds(void) {
     struct timespec ts;
@@ -83,8 +100,8 @@ static bool read_fstring(mach_port_t t, uint64_t fstring_addr, char *buf, size_t
     if (!rm_validate_ptr(fstring_addr) || max_len < 2) return false;
     struct {
         uint64_t data;
-        int32_t count;
-        int32_t max;
+        int32_t  count;
+        int32_t  max;
     } s;
     if (!rm_read(t, fstring_addr, &s, sizeof(s))) return false;
     if (s.count <= 1 || s.count > 128 || !rm_validate_ptr(s.data)) return false;
@@ -184,6 +201,62 @@ static void resolve_vehicle_name(const char *cls_name, char *name, size_t max_le
     else snprintf(name, max_len, "Vehicle");
 }
 
+static cls_type_t classify_class(uint64_t cls, uint64_t actor_sample) {
+    if (!cls) return CLS_IGNORE;
+    for (uint32_t i = 0; i < g_class_count; i++) {
+        if (g_classes[i].class_ptr == cls) return g_classes[i].type;
+    }
+
+    char name[128] = {0};
+    if (reflection && !ue4r_resolve_name(reflection, cls + OFF_UOBJECT_NAME, name, sizeof(name))) {
+        if (actor_sample) ue4r_resolve_name(reflection, actor_sample + OFF_UOBJECT_NAME, name, sizeof(name));
+    }
+
+    cls_type_t type = CLS_IGNORE;
+    if ((strstr(name, "Character") || strstr(name, "PlayerPawn")) &&
+        !strstr(name, "Controller") && !strstr(name, "Start") &&
+        !strstr(name, "State") && !strstr(name, "Camera") &&
+        !strstr(name, "AISpawner") && !strstr(name, "Movement") &&
+        !strstr(name, "AnimInstance")) {
+        type = CLS_PLAYER;
+    } else if (strstr(name, "Vehicle") || strstr(name, "VH_") || strstr(name, "Buggy") ||
+               strstr(name, "Dacia") || strstr(name, "UAZ") || strstr(name, "Motorcycle") ||
+               strstr(name, "Bike") || strstr(name, "Boat") || strstr(name, "PickUp_")) {
+        if (!strstr(name, "Wheel") && !strstr(name, "Movement") && !strstr(name, "Anim") && !strstr(name, "Spawner") && !strstr(name, "Manager")) {
+            type = CLS_VEHICLE;
+        }
+    } else if (strstr(name, "PickUp") || strstr(name, "Wrapper")) {
+        if (!strstr(name, "Destructible") && !strstr(name, "Component")) {
+            type = CLS_ITEM;
+        }
+    } else {
+        /* Check super class at 0x30 */
+        uint64_t super_cls = ptr(cls, 0x30);
+        char sname[128] = {0};
+        if (super_cls && reflection && ue4r_resolve_name(reflection, super_cls + OFF_UOBJECT_NAME, sname, sizeof(sname))) {
+            if ((strstr(sname, "Character") || strstr(sname, "PlayerPawn")) &&
+                !strstr(sname, "Controller") && !strstr(sname, "Start") &&
+                !strstr(sname, "State") && !strstr(sname, "Camera")) {
+                type = CLS_PLAYER;
+            } else if (strstr(sname, "Vehicle") || strstr(sname, "VH_")) {
+                if (!strstr(sname, "Wheel") && !strstr(sname, "Movement") && !strstr(sname, "Anim")) {
+                    type = CLS_VEHICLE;
+                }
+            } else if (strstr(sname, "PickUp") || strstr(sname, "Wrapper")) {
+                type = CLS_ITEM;
+            }
+        }
+    }
+
+    if (g_class_count < CLASS_CACHE_SIZE) {
+        uint32_t slot = g_class_count++;
+        g_classes[slot].class_ptr = cls;
+        g_classes[slot].type = type;
+        snprintf(g_classes[slot].name, sizeof(g_classes[slot].name), "%s", name);
+    }
+    return type;
+}
+
 static void publish(uint32_t status) {
     frame.header.magic = RADAR_MAGIC;
     frame.header.version = RADAR_VERSION;
@@ -203,6 +276,11 @@ static void publish(uint32_t status) {
         fprintf(logfile, "tick=%u status=%u players=%u vehicles=%u items=%u world=0x%llx local=(%.1f,%.1f,%.1f)\n",
             tick, status, frame.header.player_count, frame.header.vehicle_count, frame.header.item_count,
             world, frame.header.local_pos.x, frame.header.local_pos.y, frame.header.local_pos.z);
+        fflush(logfile);
+    }
+    if (logfile && status == 2 && !first_live) {
+        first_live = true;
+        fprintf(logfile, "STARTUP first_live_ms=%.1f tick=%u players=%u camera=%u\n", (now_seconds()-started_at)*1000, tick, frame.header.player_count, frame.header.camera_valid);
         fflush(logfile);
     }
     last_status = status;
@@ -242,6 +320,7 @@ static uint64_t find_world(void) {
                 character_count = 0;
                 vehicle_count = 0;
                 item_count = 0;
+                g_class_count = 0;
             }
             world = current;
             return world;
@@ -264,128 +343,92 @@ static uint64_t find_world(void) {
     }
     if (world_cursor < 0) {
         world_cursor = 0;
-        next_lookup = now + 0.5;
+        next_lookup = now + 0.05;
         return 0;
     }
-    uint64_t candidate = ue4r_find_instance(reflection, "LocalPlayer", &world_cursor);
-    if (candidate) {
-        uint64_t viewport = ptr(candidate, 0x58), w = ptr(viewport, 0x78), pc = ptr(candidate, 0x30);
-        if (logfile) {
-            fprintf(logfile, "LocalPlayer=0x%llx viewport=0x%llx world=0x%llx pc=0x%llx backlink=0x%llx\n",
-                candidate, viewport, w, pc, ptr(pc, 0x518));
-            fflush(logfile);
-        }
-        if (w && pc && ptr(pc, 0x518) == candidate) {
-            local_player = candidate;
-            world = w;
+
+    /* Fast batched search for LocalPlayer */
+    for (int b = 0; b < 16 && world_cursor >= 0; b++) {
+        uint64_t candidate = ue4r_find_instance(reflection, "LocalPlayer", &world_cursor);
+        if (candidate) {
+            uint64_t viewport = ptr(candidate, 0x58), w = ptr(viewport, 0x78), pc = ptr(candidate, 0x30);
+            if (logfile) {
+                fprintf(logfile, "LocalPlayer=0x%llx viewport=0x%llx world=0x%llx pc=0x%llx backlink=0x%llx\n",
+                    candidate, viewport, w, pc, ptr(pc, 0x518));
+                fflush(logfile);
+            }
+            if (w && pc && ptr(pc, 0x518) == candidate) {
+                local_player = candidate;
+                world = w;
+                break;
+            }
         }
     }
     return world;
 }
 
-static void add_character(uint64_t actor) {
-    if (!actor) return;
-    for (unsigned i = 0; i < character_count; i++) {
-        if (characters[i] == actor) return;
-    }
-    if (character_count < 512) {
-        characters[character_count++] = actor;
-    }
-}
-
-static void add_vehicle(uint64_t actor) {
-    if (!actor) return;
-    for (unsigned i = 0; i < vehicle_count; i++) {
-        if (vehicles[i] == actor) return;
-    }
-    if (vehicle_count < 64) {
-        vehicles[vehicle_count++] = actor;
-    }
-}
-
-static void add_item(uint64_t actor) {
-    if (!actor) return;
-    for (unsigned i = 0; i < item_count; i++) {
-        if (items[i] == actor) return;
-    }
-    if (item_count < 256) {
-        items[item_count++] = actor;
-    }
-}
-
-/* Fast scan of PersistentLevel Actors array */
+/* Fast scan of PersistentLevel Actors array with batched pointer read */
 static bool scan_persistent_level(uint64_t w) {
     uint64_t level = ptr(w, 0x30);
     if (!level) return false;
 
-    /* Search common offsets in ULevel for TArray<AActor*> Actors */
-    static const uint64_t offsets[] = { 0x98, 0xa0, 0xa8, 0xb0, 0x90, 0x70, 0x78, 0x80 };
+    static const uint64_t offsets[] = { 0xa0, 0xb0, 0x98, 0xa8, 0x90, 0x70 };
     uint64_t data = 0;
     int32_t count = 0;
     bool found_arr = false;
     for (size_t o = 0; o < sizeof(offsets)/sizeof(offsets[0]); o++) {
-        if (array(level, offsets[o], &data, &count, 8192) && count >= 10) {
+        if (array(level, offsets[o], &data, &count, 8192) && count >= 5) {
             found_arr = true;
             break;
         }
     }
-    if (!found_arr || !data || count < 10) return false;
+    if (!found_arr || !data || count < 5) return false;
 
-    /* Classify actors */
-    for (int i = 0; i < count; i++) {
-        uint64_t actor = rm_read_ptr(task, data + (uint64_t)i * 8);
-        if (!rm_validate_ptr(actor)) continue;
-        uint64_t cls = ptr(actor, 0x10);
-        if (!cls) continue;
+    uint64_t new_chars[512];
+    unsigned new_char_cnt = 0;
+    uint64_t new_vehs[64];
+    unsigned new_veh_cnt = 0;
+    uint64_t new_items[256];
+    unsigned new_item_cnt = 0;
 
-        char cls_name[128] = {0};
-        if (!ue4r_resolve_name(reflection, cls + OFF_UOBJECT_NAME, cls_name, sizeof(cls_name))) continue;
+    /* Batch read actor pointers in chunks of 512 */
+    uint64_t actor_chunk[512];
+    for (int start = 0; start < count; start += 512) {
+        int chunk_size = count - start;
+        if (chunk_size > 512) chunk_size = 512;
+        if (!rm_read(task, data + (uint64_t)start * 8, actor_chunk, chunk_size * sizeof(uint64_t))) {
+            continue;
+        }
+        for (int i = 0; i < chunk_size; i++) {
+            uint64_t actor = actor_chunk[i];
+            if (!rm_validate_ptr(actor)) continue;
+            uint64_t cls = ptr(actor, 0x10);
+            if (!cls) continue;
 
-        if (strstr(cls_name, "Character") || strstr(cls_name, "Player")) {
-            add_character(actor);
-        } else if (strstr(cls_name, "Vehicle") || strstr(cls_name, "VH_")) {
-            add_vehicle(actor);
-        } else if (strstr(cls_name, "PickUp") || strstr(cls_name, "Wrapper")) {
-            add_item(actor);
+            cls_type_t t = classify_class(cls, actor);
+            if (t == CLS_PLAYER && new_char_cnt < 512) {
+                new_chars[new_char_cnt++] = actor;
+            } else if (t == CLS_VEHICLE && new_veh_cnt < 64) {
+                new_vehs[new_veh_cnt++] = actor;
+            } else if (t == CLS_ITEM && new_item_cnt < 256) {
+                new_items[new_item_cnt++] = actor;
+            }
         }
     }
+
+    memcpy(characters, new_chars, new_char_cnt * sizeof(uint64_t));
+    character_count = new_char_cnt;
+    memcpy(vehicles, new_vehs, new_veh_cnt * sizeof(uint64_t));
+    vehicle_count = new_veh_cnt;
+    memcpy(items, new_items, new_item_cnt * sizeof(uint64_t));
+    item_count = new_item_cnt;
     return true;
-}
-
-/* Fallback: reflection instance discovery */
-static void scan_reflection_instances(void) {
-    if (!reflection || !ue4r_ready(reflection)) return;
-
-    /* Scan characters */
-    if (char_cursor >= 0) {
-        for (int b = 0; b < 4; b++) {
-            uint64_t found = ue4r_find_instance(reflection, "STExtraBaseCharacter", &char_cursor);
-            if (found) add_character(found);
-            if (char_cursor < 0) { char_cursor = 0; break; }
-        }
-    }
-
-    /* Scan vehicles */
-    if (veh_cursor >= 0) {
-        for (int b = 0; b < 2; b++) {
-            uint64_t found = ue4r_find_instance(reflection, "STExtraVehicleBase", &veh_cursor);
-            if (found) add_vehicle(found);
-            if (veh_cursor < 0) { veh_cursor = 0; break; }
-        }
-    }
-
-    /* Scan loot items */
-    if (item_cursor >= 0) {
-        for (int b = 0; b < 4; b++) {
-            uint64_t found = ue4r_find_instance(reflection, "PickUpWrapperActor", &item_cursor);
-            if (found) add_item(found);
-            if (item_cursor < 0) { item_cursor = 0; break; }
-        }
-    }
 }
 
 int radar_init(mach_port_t target, uint64_t image_base, uint64_t aslr_slide) {
     local_player = 0;
+    started_at = now_seconds();
+    first_live = false;
     task = target;
     base = image_base;
     slide = aslr_slide;
@@ -394,13 +437,11 @@ int radar_init(mach_port_t target, uint64_t image_base, uint64_t aslr_slide) {
     next_lookup = 0;
     last_status = UINT32_MAX;
     world_cursor = 0;
-    char_cursor = 0;
-    veh_cursor = 0;
-    item_cursor = 0;
     character_count = 0;
     vehicle_count = 0;
     item_count = 0;
     next_scan_time = 0;
+    g_class_count = 0;
 
     logfile = fopen("/var/mobile/Downloads/ue4_radar.log", "a");
     fd = open(RADAR_FILE_PATH, O_RDWR | O_CREAT, 0644);
@@ -466,10 +507,8 @@ int radar_tick(void) {
     /* Actor discovery cadence */
     double now = now_seconds();
     if (now >= next_scan_time) {
-        next_scan_time = now + 0.15; /* 150ms scan interval */
-        if (!scan_persistent_level(world)) {
-            scan_reflection_instances();
-        }
+        next_scan_time = now + 0.25; /* 250ms discovery cadence */
+        scan_persistent_level(world);
     }
 
     /* Process characters / players */
@@ -484,12 +523,36 @@ int radar_tick(void) {
             continue;
         }
 
+        /* Filter out unspawned or dummy actors at world origin (0,0,0) */
+        if (fabsf(p.pos.x) < 1.0f && fabsf(p.pos.y) < 1.0f && fabsf(p.pos.z) < 1.0f) continue;
+
+        /* Check dead flag on character (STExtraCharacter + 0xe7c) */
+        uint8_t b_dead = 0;
+        rm_read(task, other + 0xe7c, &b_dead, 1);
+        if (b_dead) continue;
+
         uint64_t st = ptr(other, 0x2410);
         if (!st) st = ptr(other, 0x4d0);
-        if (!st) continue;
 
-        if (!rm_read(task, st + 0x142c, &p.health, 4) || !rm_read(task, st + 0x1430, &p.health_max, 4)) continue;
-        if (!isfinite(p.health) || !isfinite(p.health_max) || p.health_max <= 0 || p.health_max > 100000) continue;
+        /* Dual-source health: STExtraCharacter + 0xe60 / 0xe64, fallback to STExtraPlayerState + 0x142c / 0x1430 */
+        float hp = 0.0f, hp_max = 0.0f;
+        rm_read(task, other + 0xe60, &hp, 4);
+        rm_read(task, other + 0xe64, &hp_max, 4);
+        if (!isfinite(hp) || hp <= 0.0f || !isfinite(hp_max) || hp_max <= 0.0f) {
+            if (st) {
+                float st_hp = 0.0f, st_hp_max = 0.0f;
+                rm_read(task, st + 0x142c, &st_hp, 4);
+                rm_read(task, st + 0x1430, &st_hp_max, 4);
+                if (isfinite(st_hp) && st_hp > 0.0f) hp = st_hp;
+                if (isfinite(st_hp_max) && st_hp_max > 0.0f) hp_max = st_hp_max;
+            }
+        }
+
+        if (!isfinite(hp) || hp < 0.0f) hp = 0.0f;
+        if (!isfinite(hp_max) || hp_max <= 0.0f || hp_max > 10000.0f) hp_max = 100.0f;
+        if (hp > hp_max) hp_max = hp;
+        p.health = hp;
+        p.health_max = hp_max;
 
         rm_read(task, other + 0x2be8, &p.health_status, 1);
         if (p.health_status == 2) continue; /* Dead */
@@ -498,15 +561,21 @@ int radar_tick(void) {
         if (vec(ptr(other, 0x208), 0x1f0, &rot)) p.yaw = rot.y;
 
         /* Team and bot */
-        rm_read(task, st + 0x700, &p.team_id, 4);
-        rm_read(task, st + 0x4dc, &p.is_bot, 1);
+        if (st) {
+            rm_read(task, st + 0x700, &p.team_id, 4);
+            uint8_t raw_bot = 0;
+            rm_read(task, st + 0x4dc, &raw_bot, 1);
+            p.is_bot = (raw_bot & 0x08) ? 1 : ((raw_bot != 0) ? 1 : 0);
 
-        /* Player Name */
-        if (!read_fstring(task, st + 0x4b8, p.name, sizeof(p.name))) {
-            if (!read_fstring(task, st + 0x13e0, p.name, sizeof(p.name))) {
-                if (p.is_bot) snprintf(p.name, sizeof(p.name), "Bot");
-                else snprintf(p.name, sizeof(p.name), "Player");
+            /* Player Name */
+            if (!read_fstring(task, st + 0x4b8, p.name, sizeof(p.name))) {
+                if (!read_fstring(task, st + 0x13e0, p.name, sizeof(p.name))) {
+                    if (p.is_bot) snprintf(p.name, sizeof(p.name), "Bot");
+                    else snprintf(p.name, sizeof(p.name), "Player");
+                }
             }
+        } else {
+            snprintf(p.name, sizeof(p.name), "Player");
         }
 
         /* Distance */
@@ -565,7 +634,7 @@ int radar_tick(void) {
         float dy = v.pos.y - camera_pos.y;
         float dz = v.pos.z - camera_pos.z;
         v.distance = sqrtf(dx*dx + dy*dy + dz*dz) / 100.0f;
-        if (v.distance > 450.0f) continue; /* Skip vehicles beyond 450m */
+        if (v.distance > 500.0f) continue; /* Skip vehicles beyond 500m */
 
         float fwd_speed = 0.0f;
         rm_read(task, vactor + 0xcd0, &fwd_speed, 4);
@@ -577,7 +646,13 @@ int radar_tick(void) {
 
         char cls_buf[128] = {0};
         uint64_t cls = ptr(vactor, 0x10);
-        if (cls && reflection) {
+        for (uint32_t c = 0; c < g_class_count; c++) {
+            if (g_classes[c].class_ptr == cls) {
+                snprintf(cls_buf, sizeof(cls_buf), "%s", g_classes[c].name);
+                break;
+            }
+        }
+        if (!cls_buf[0] && cls && reflection) {
             ue4r_resolve_name(reflection, cls + OFF_UOBJECT_NAME, cls_buf, sizeof(cls_buf));
         }
         resolve_vehicle_name(cls_buf, v.name, sizeof(v.name));
@@ -613,8 +688,8 @@ int radar_tick(void) {
     }
 
     if (logfile && tick % 200 == 0) {
-        fprintf(logfile, "radar_tick: players=%u vehicles=%u items=%u world=0x%llx\n",
-            frame.header.player_count, frame.header.vehicle_count, frame.header.item_count, world);
+        fprintf(logfile, "radar_tick: players=%u vehicles=%u items=%u world=0x%llx cached_classes=%u\n",
+            frame.header.player_count, frame.header.vehicle_count, frame.header.item_count, world, g_class_count);
         fflush(logfile);
     }
 

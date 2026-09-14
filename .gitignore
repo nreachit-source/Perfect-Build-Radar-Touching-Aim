@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+minimal_test.dylib
+*.tmp
+start_usb.log
+tools/codex_exec_*.sh

@@ -754,8 +754,19 @@ uint64_t ue4r_find_instance(ue4r_ctx_t *ctx, const char *name, int32_t *cursor) 
         ctx->lookup_class=0;memset(ctx->lookup_keys,0,sizeof(ctx->lookup_keys));*cursor=0;
     }
     int budget=512;
+    int32_t batch_start = *cursor;
+    int32_t batch_count = count - batch_start;
+    if (batch_count > 512) batch_count = 512;
+    unsigned char items[512 * FUOBJECTITEM_SIZE];
+    bool batch_ok = batch_count > 0 && rm_read(ctx->task,
+        objects + (uint64_t)batch_start * FUOBJECTITEM_SIZE,
+        items, (size_t)batch_count * FUOBJECTITEM_SIZE);
     while(*cursor<count && budget-->0) {
-        uint64_t obj=read_object_from_array(ctx,objects,(*cursor)++);
+        int32_t index = (*cursor)++;
+        uint64_t obj = 0;
+        if (batch_ok && index >= batch_start && index < batch_start + batch_count)
+            memcpy(&obj, items + (index - batch_start) * FUOBJECTITEM_SIZE + FUOBJECTITEM_OBJECT, sizeof(obj));
+        if (!rm_validate_ptr(obj)) obj=read_object_from_array(ctx,objects,index);
         if(!rm_validate_ptr(obj))continue;
         struct {uint64_t vtable;uint32_t flags,index;uint64_t cls;} header;
         if(!rm_read(ctx->task,obj,&header,sizeof(header)))continue;

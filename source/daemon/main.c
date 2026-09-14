@@ -167,7 +167,7 @@ int main(int argc, char **argv) {
         } else if (pid == 0) {
             last_reported_pid = 0;
         }
-        sleep(1);
+        usleep(250000); /* Detect launch/recover task acquisition within 250ms. */
     }
     return 0;
 }

@@ -4,13 +4,13 @@ Suite: stable
 Codename: ios
 Architectures: iphoneos-arm64
 Components: main
-Description: Private UE4 monitor development repository
+Description: UE4 radar release repository
 MD5Sum:
- 9754ed4d5f69d5836e270179cf35d29c              518 Packages
- a0a3d36362f9aebcee5be8a2b3015093              362 Packages.gz
+ 2af4287cb4e9d6de63c943dcb4017810              501 Packages
+ 2eca19535acf03343a13d9ab746a2e3b              368 Packages.gz
 SHA1:
- 18f12874e5c3d4a96451675b150a1307796f6cb5              518 Packages
- 722a787c01405472b756b9ac91fcd6fb5db4283f              362 Packages.gz
+ fb3a08671e8cb8b862449288f4a6dc40ccacad92              501 Packages
+ 729b9f015a7597b7da80b1ac07f712781b868640              368 Packages.gz
 SHA256:
- 06994a3593bae169b4aefa2b33639da07be1137fefc8e1c31b9d6a9676ab4cb6              518 Packages
- 7582228b7a08d118380560140e3b70f8039d6243895b39ffe665d341174f52e4              362 Packages.gz
+ 6f2aa9861f211abd66568e2ddb387306aa822d8fcce00ab03dd3612da51fcb6b              501 Packages
+ 2f354f8d53c5bf92231d926add2f07e4eee9555b1fc95677389453e0d287b058              368 Packages.gz
