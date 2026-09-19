@@ -1,10 +1,10 @@
 {
   "version": "1.3.4",
-  "build": "server-passthrough-20260914",
+  "build": "touch-delivery-20260919",
   "sha256": {
-    "ue4loadmonitor": "d00e5e7da333383e2a510b0790807dd4d7ae0ba8f1bef1a6b752d61bcf23a7f9",
-    "radar_overlay.dylib": "ecf2268a08e43dc339be2dd8e1dea48ef3847c0fa6102f3065515237708bc601"
+    "ue4loadmonitor": "5c449da9a77aab922bc3f813829c550fa8c4195dc38e998b38f39839b6db2467",
+    "radar_overlay.dylib": "f35069869b5e195d36047f3c95c09bdd6a045f8e4b46ffc8dd2f877ab38b66c2"
   },
   "source": "source/overlay/radar_overlay.m",
-  "note": "Signed binaries retrieved from the phone; Mach-O sections match build_codex."
+  "note": "Signed artifacts match installed device SHA-256. Build and dispatch checks passed; foreground touch delivery awaits gameplay verification."
 }

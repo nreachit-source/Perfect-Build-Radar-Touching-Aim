@@ -39,7 +39,8 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     src = ROOT / "source" / "daemon"
     common = [str(args.zig), "cc", "-target", "aarch64-macos", "-std=c11",
-              "-O2", "-Wall", "-Wextra", "-Werror"]
+              "-O2", "-Wall", "-Wextra", "-Werror",
+              "-fno-builtin-sinf", "-fno-builtin-cosf", "-fno-builtin-sin", "-fno-builtin-cos"]
     daemon = ["main", "ue4_sdk", "remote_memory", "aslr_slide", "pattern_scan",
               "ue4_reflection", "ue4_json", "radar_reader"]
     targets = {

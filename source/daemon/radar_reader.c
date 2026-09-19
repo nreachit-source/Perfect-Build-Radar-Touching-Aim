@@ -35,7 +35,7 @@ static double next_lookup;
 static int32_t world_cursor;
 
 /* Fast Class Cache: resolves each UClass* at most once */
-#define CLASS_CACHE_SIZE 1024
+#define CLASS_CACHE_SIZE 4096
 typedef enum {
     CLS_UNKNOWN = 0,
     CLS_IGNORE,
@@ -62,6 +62,93 @@ static uint64_t items[256];
 static unsigned item_count;
 static double   next_scan_time;
 static uint32_t s_cached_local_team = 0;
+
+/* High-efficiency metadata cache to eliminate redundant Mach IPC kernel traps */
+typedef struct {
+    uint64_t actor;
+    uint32_t team_id;
+    uint8_t  is_bot;
+    char     name[32];
+    bool     valid;
+} player_meta_cache_t;
+
+#define PLAYER_META_CACHE_SIZE 512
+static player_meta_cache_t g_player_meta[PLAYER_META_CACHE_SIZE];
+static unsigned            g_player_meta_count = 0;
+
+static const player_meta_cache_t *find_player_meta(uint64_t actor) {
+    for (unsigned i = 0; i < g_player_meta_count; i++) {
+        if (g_player_meta[i].valid && g_player_meta[i].actor == actor) {
+            return &g_player_meta[i];
+        }
+    }
+    return NULL;
+}
+
+static void store_player_meta(uint64_t actor, uint32_t team_id, uint8_t is_bot, const char *name) {
+    for (unsigned i = 0; i < g_player_meta_count; i++) {
+        if (g_player_meta[i].actor == actor) {
+            g_player_meta[i].team_id = team_id;
+            g_player_meta[i].is_bot = is_bot;
+            strncpy(g_player_meta[i].name, name, sizeof(g_player_meta[i].name) - 1);
+            g_player_meta[i].name[sizeof(g_player_meta[i].name) - 1] = '\0';
+            g_player_meta[i].valid = true;
+            return;
+        }
+    }
+    if (g_player_meta_count < PLAYER_META_CACHE_SIZE) {
+        unsigned idx = g_player_meta_count++;
+        g_player_meta[idx].actor = actor;
+        g_player_meta[idx].team_id = team_id;
+        g_player_meta[idx].is_bot = is_bot;
+        strncpy(g_player_meta[idx].name, name, sizeof(g_player_meta[idx].name) - 1);
+        g_player_meta[idx].name[sizeof(g_player_meta[idx].name) - 1] = '\0';
+        g_player_meta[idx].valid = true;
+    }
+}
+
+typedef struct {
+    uint64_t actor;
+    int32_t  item_id;
+    uint8_t  category;
+    char     name[32];
+    bool     valid;
+} item_meta_cache_t;
+
+#define ITEM_META_CACHE_SIZE 256
+static item_meta_cache_t g_item_meta[ITEM_META_CACHE_SIZE];
+static unsigned          g_item_meta_count = 0;
+
+static const item_meta_cache_t *find_item_meta(uint64_t actor) {
+    for (unsigned i = 0; i < g_item_meta_count; i++) {
+        if (g_item_meta[i].valid && g_item_meta[i].actor == actor) {
+            return &g_item_meta[i];
+        }
+    }
+    return NULL;
+}
+
+static void store_item_meta(uint64_t actor, int32_t item_id, uint8_t category, const char *name) {
+    for (unsigned i = 0; i < g_item_meta_count; i++) {
+        if (g_item_meta[i].actor == actor) {
+            g_item_meta[i].item_id = item_id;
+            g_item_meta[i].category = category;
+            strncpy(g_item_meta[i].name, name, sizeof(g_item_meta[i].name) - 1);
+            g_item_meta[i].name[sizeof(g_item_meta[i].name) - 1] = '\0';
+            g_item_meta[i].valid = true;
+            return;
+        }
+    }
+    if (g_item_meta_count < ITEM_META_CACHE_SIZE) {
+        unsigned idx = g_item_meta_count++;
+        g_item_meta[idx].actor = actor;
+        g_item_meta[idx].item_id = item_id;
+        g_item_meta[idx].category = category;
+        strncpy(g_item_meta[idx].name, name, sizeof(g_item_meta[idx].name) - 1);
+        g_item_meta[idx].name[sizeof(g_item_meta[idx].name) - 1] = '\0';
+        g_item_meta[idx].valid = true;
+    }
+}
 
 static double now_seconds(void) {
     struct timespec ts;
@@ -473,6 +560,8 @@ static uint64_t find_world(void) {
                 vehicle_count = 0;
                 item_count = 0;
                 g_class_count = 0;
+                g_player_meta_count = 0;
+                g_item_meta_count = 0;
             }
             world = current;
             return world;
@@ -482,7 +571,7 @@ static uint64_t find_world(void) {
     world = 0;
     double now = now_seconds();
     if (now < next_lookup) return 0;
-    next_lookup = now + 0.05;
+    next_lookup = now + 0.50;
     if (!reflection) {
         uint64_t objects, names;
         read_config(&objects, &names);
@@ -495,7 +584,7 @@ static uint64_t find_world(void) {
     }
     if (world_cursor < 0) {
         world_cursor = 0;
-        next_lookup = now + 0.05;
+        next_lookup = now + 0.50;
         return 0;
     }
 
@@ -594,6 +683,8 @@ int radar_init(mach_port_t target, uint64_t image_base, uint64_t aslr_slide) {
     item_count = 0;
     next_scan_time = 0;
     g_class_count = 0;
+    g_player_meta_count = 0;
+    g_item_meta_count = 0;
     s_cached_local_team = 0;
 
     logfile = fopen("/var/mobile/Downloads/ue4_radar.log", "a");
@@ -675,7 +766,7 @@ int radar_tick(void) {
     /* Actor discovery cadence */
     double now = now_seconds();
     if (now >= next_scan_time) {
-        next_scan_time = now + 0.25; /* 250ms discovery cadence */
+        next_scan_time = now + 1.25; /* 1.25s discovery cadence — eliminates CPU hogging and thermal panics */
         scan_persistent_level(world);
     }
 
@@ -728,34 +819,43 @@ int radar_tick(void) {
         rvec3_t rot;
         if (vec(ptr(other, 0x208), 0x1f0, &rot)) p.yaw = rot.y;
 
-        /* Team and bot */
-        if (st) {
-            rm_read(task, st + 0x700, &p.team_id, 4);
-            uint8_t raw_bot = 0;
-            rm_read(task, st + 0x4dc, &raw_bot, 1);
-            /* In UE4 PlayerState at offset 1244 (0x4dc), bit 2 (0x04) is bIsABot.
-             * Bit 3 (0x08) is bIsInactive, bit 4 (0x10) is bFromPreviousLevel.
-             * Only bit 2 indicates an AI bot. */
-            p.is_bot = (raw_bot & 0x04) ? 1 : 0;
+        /* Cached player metadata (team, bot, name) to eliminate redundant IPC reads */
+        const player_meta_cache_t *pmeta = find_player_meta(other);
+        if (pmeta) {
+            p.team_id = pmeta->team_id;
+            p.is_bot = pmeta->is_bot;
+            memcpy(p.name, pmeta->name, sizeof(p.name));
+        } else {
+            /* Team and bot */
+            if (st) {
+                rm_read(task, st + 0x700, &p.team_id, 4);
+                uint8_t raw_bot = 0;
+                rm_read(task, st + 0x4dc, &raw_bot, 1);
+                /* In UE4 PlayerState at offset 1244 (0x4dc), bit 2 (0x04) is bIsABot.
+                 * Bit 3 (0x08) is bIsInactive, bit 4 (0x10) is bFromPreviousLevel.
+                 * Only bit 2 indicates an AI bot. */
+                p.is_bot = (raw_bot & 0x04) ? 1 : 0;
 
+                /* Critical Invariant: Teammates on our team can NEVER be classified as bots */
+                if (frame.header.local_team != 0 && p.team_id == frame.header.local_team) {
+                    p.is_bot = 0;
+                }
+
+                /* Player Name */
+                if (!read_fstring(task, st + 0x4b8, p.name, sizeof(p.name))) {
+                    if (!read_fstring(task, st + 0x13e0, p.name, sizeof(p.name))) {
+                        if (p.is_bot) snprintf(p.name, sizeof(p.name), "Bot");
+                        else snprintf(p.name, sizeof(p.name), "Player");
+                    }
+                }
+            } else {
+                snprintf(p.name, sizeof(p.name), "Player");
+            }
             /* Critical Invariant: Teammates on our team can NEVER be classified as bots */
             if (frame.header.local_team != 0 && p.team_id == frame.header.local_team) {
                 p.is_bot = 0;
             }
-
-            /* Player Name */
-            if (!read_fstring(task, st + 0x4b8, p.name, sizeof(p.name))) {
-                if (!read_fstring(task, st + 0x13e0, p.name, sizeof(p.name))) {
-                    if (p.is_bot) snprintf(p.name, sizeof(p.name), "Bot");
-                    else snprintf(p.name, sizeof(p.name), "Player");
-                }
-            }
-        } else {
-            snprintf(p.name, sizeof(p.name), "Player");
-        }
-        /* Critical Invariant: Teammates on our team can NEVER be classified as bots */
-        if (frame.header.local_team != 0 && p.team_id == frame.header.local_team) {
-            p.is_bot = 0;
+            store_player_meta(other, p.team_id, p.is_bot, p.name);
         }
 
         /* Distance */
@@ -863,48 +963,59 @@ int radar_tick(void) {
         item.distance = sqrtf(dx*dx + dy*dy + dz*dz) / 100.0f;
         if (item.distance > 120.0f) continue; /* Skip distant loot */
 
-        /* Enhanced multi-offset ItemId resolution for PickUpWrapperActor & PickUpListWrapperActor */
-        rm_read(task, iactor + 0x758, &item.item_id, 4);  /* Primary ItemId (1880) */
-        if (item.item_id <= 0) {
-            rm_read(task, iactor + 1528, &item.item_id, 4); /* DefineID struct TypeSpecificID (1528 / 0x5F8) */
-        }
-        if (item.item_id <= 0) {
-            /* PickUpListWrapperActor: read PickUpDataList TArray at offset 2408 (0x968) */
-            uint64_t list_data = ptr(iactor, 2408);
-            if (list_data) {
-                rm_read(task, list_data, &item.item_id, 4);
+        /* Fast cached item resolution to avoid per-frame GNamePool reflection lookups */
+        const item_meta_cache_t *imeta = find_item_meta(iactor);
+        if (imeta) {
+            item.item_id = imeta->item_id;
+            item.category = imeta->category;
+            memcpy(item.name, imeta->name, sizeof(item.name));
+            rm_read(task, iactor + 0x610, &item.count, 4);
+            if (item.count <= 0) item.count = 1;
+        } else {
+            /* Enhanced multi-offset ItemId resolution for PickUpWrapperActor & PickUpListWrapperActor */
+            rm_read(task, iactor + 0x758, &item.item_id, 4);  /* Primary ItemId (1880) */
+            if (item.item_id <= 0) {
+                rm_read(task, iactor + 1528, &item.item_id, 4); /* DefineID struct TypeSpecificID (1528 / 0x5F8) */
             }
-        }
-        rm_read(task, iactor + 0x610, &item.count, 4);
-        if (item.count <= 0) item.count = 1;
-
-        item.name[0] = '\0';
-        if (item.item_id > 0) {
-            resolve_item_info(item.item_id, item.name, sizeof(item.name), &item.category);
-        }
-
-        /* If item name is unresolved or generic, resolve via actor name, class name, and PickupMesh */
-        if (item.name[0] == '\0' || strncmp(item.name, "Item", 4) == 0 || strcmp(item.name, "Loot Crate") == 0) {
-            char aname[128] = {0};
-            if (reflection && ue4r_resolve_name(reflection, iactor + OFF_UOBJECT_NAME, aname, sizeof(aname))) {
-                resolve_item_from_actor_name(aname, item.name, sizeof(item.name), &item.category);
-            }
-            if (item.name[0] == '\0' || strncmp(item.name, "Item", 4) == 0 || strcmp(item.name, "Loot Crate") == 0) {
-                uint64_t acls = ptr(iactor, 0x10);
-                if (acls && reflection && ue4r_resolve_name(reflection, acls + OFF_UOBJECT_NAME, aname, sizeof(aname))) {
-                    resolve_item_from_actor_name(aname, item.name, sizeof(item.name), &item.category);
+            if (item.item_id <= 0) {
+                /* PickUpListWrapperActor: read PickUpDataList TArray at offset 2408 (0x968) */
+                uint64_t list_data = ptr(iactor, 2408);
+                if (list_data) {
+                    rm_read(task, list_data, &item.item_id, 4);
                 }
             }
+            rm_read(task, iactor + 0x610, &item.count, 4);
+            if (item.count <= 0) item.count = 1;
+
+            item.name[0] = '\0';
+            if (item.item_id > 0) {
+                resolve_item_info(item.item_id, item.name, sizeof(item.name), &item.category);
+            }
+
+            /* If item name is unresolved or generic, resolve via actor name, class name, and PickupMesh */
             if (item.name[0] == '\0' || strncmp(item.name, "Item", 4) == 0 || strcmp(item.name, "Loot Crate") == 0) {
-                uint64_t pmesh = ptr(iactor, 1816); /* PickupMesh (0x718) */
-                if (pmesh && reflection && ue4r_resolve_name(reflection, pmesh + OFF_UOBJECT_NAME, aname, sizeof(aname))) {
+                char aname[128] = {0};
+                if (reflection && ue4r_resolve_name(reflection, iactor + OFF_UOBJECT_NAME, aname, sizeof(aname))) {
                     resolve_item_from_actor_name(aname, item.name, sizeof(item.name), &item.category);
                 }
+                if (item.name[0] == '\0' || strncmp(item.name, "Item", 4) == 0 || strcmp(item.name, "Loot Crate") == 0) {
+                    uint64_t acls = ptr(iactor, 0x10);
+                    if (acls && reflection && ue4r_resolve_name(reflection, acls + OFF_UOBJECT_NAME, aname, sizeof(aname))) {
+                        resolve_item_from_actor_name(aname, item.name, sizeof(item.name), &item.category);
+                    }
+                }
+                if (item.name[0] == '\0' || strncmp(item.name, "Item", 4) == 0 || strcmp(item.name, "Loot Crate") == 0) {
+                    uint64_t pmesh = ptr(iactor, 1816); /* PickupMesh (0x718) */
+                    if (pmesh && reflection && ue4r_resolve_name(reflection, pmesh + OFF_UOBJECT_NAME, aname, sizeof(aname))) {
+                        resolve_item_from_actor_name(aname, item.name, sizeof(item.name), &item.category);
+                    }
+                }
             }
-        }
-        if (item.name[0] == '\0') {
-            snprintf(item.name, sizeof(item.name), "Supply");
-            item.category = 5;
+            if (item.name[0] == '\0') {
+                snprintf(item.name, sizeof(item.name), "Supply");
+                item.category = 5;
+            }
+            store_item_meta(iactor, item.item_id, item.category, item.name);
         }
 
         frame.items[frame.header.item_count++] = item;

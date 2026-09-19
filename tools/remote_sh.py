@@ -7,7 +7,30 @@ import uuid
 
 PY3 = os.environ.get("RADAR_PYTHON", r"C:\Users\GAME\Desktop\BUILD\iPhone_RE_Toolchain\.venv\Scripts\python.exe")
 
+def ensure_usb():
+    try:
+        with socket.create_connection(("127.0.0.1", 1337), timeout=1):
+            return
+    except OSError:
+        pass
+    log_path = os.path.join(os.path.dirname(__file__), "..", "start_usb.log")
+    try:
+        log = open(log_path, "a")
+        subprocess.Popen([PY3, "-m", "pymobiledevice3", "usbmux", "forward", "1337", "1337"],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
+        log.close()
+    except Exception:
+        pass
+    for _ in range(20):
+        try:
+            with socket.create_connection(("127.0.0.1", 1337), timeout=1):
+                return
+        except OSError:
+            time.sleep(0.25)
+
 def run_script(script_text, timeout=25):
+    ensure_usb()
     # Ensure LF newlines
     script_text = script_text.replace("\r\n", "\n")
     if not script_text.startswith("#!"):

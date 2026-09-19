@@ -68,55 +68,91 @@ def _watchdog_petter_loop():
         _stop_event.wait(60)
 
 
+def exit_safe_mode():
+    """Clears Dopamine safe mode flag and cleanly resprings SpringBoard."""
+    print("[*] Clearing Dopamine safe mode flag and reloading SpringBoard...", flush=True)
+    script = """
+rm -f /var/jb/basebin/.safe_mode
+rm -f /var/mobile/Downloads/overlay_sb_pid.txt
+if [ -x /var/jb/usr/bin/sbreload ]; then
+    /var/jb/usr/bin/sbreload || killall -9 SpringBoard
+else
+    killall -9 SpringBoard
+fi
+"""
+    remote(script, timeout=15)
+    time.sleep(3)
+    # Wait for new SpringBoard PID and verify overlay loaded
+    for _ in range(6):
+        try:
+            res = remote("""
+LINE=$(ps -ef | grep SpringBoard | grep -v grep | head -n1)
+set -- $LINE
+SB=$2
+RECORDED=$(cat /var/mobile/Downloads/overlay_sb_pid.txt 2>/dev/null)
+echo "$SB $RECORDED"
+""", timeout=5)
+            parts = res.strip().split()
+            if len(parts) >= 2 and parts[0] == parts[1] and parts[0]:
+                print(f"[+] Safe mode cleared! SpringBoard restarted (PID {parts[0]}) with overlay active.", flush=True)
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    print("[+] Safe mode cleared and SpringBoard respringed.", flush=True)
+    return True
+
+
 def ensure_overlay(force=False):
-    """Ensures radar_overlay.dylib is actively injected into SpringBoard without duplicate injection crashes."""
-    force_flag = "1" if force else "0"
-    script = f"""
+    """Ensures radar_overlay.dylib is active in SpringBoard via ElleKit without crashes or safe mode traps."""
+    # 1. Clear any safe mode flag if present
+    check_sm = remote("if [ -f /var/jb/basebin/.safe_mode ]; then echo 'SAFE_MODE'; fi")
+    if "SAFE_MODE" in check_sm:
+        print("[!] Dopamine Safe Mode detected! Automatically exiting safe mode...", flush=True)
+        exit_safe_mode()
+        return True
+
+    # 2. If force restart requested, respring cleanly via sbreload (NEVER call opainject!)
+    if force:
+        print("[*] Performing soft respring to reload overlay cleanly...", flush=True)
+        exit_safe_mode()
+        return True
+
+    # 3. Check if SpringBoard currently has the overlay running
+    check_script = """
 LINE=$(ps -ef | grep SpringBoard | grep -v grep | head -n1)
 set -- $LINE
 SB=$2
 if [ -z "$SB" ]; then
     echo "NO_SPRINGBOARD"
-else
-    # Check if proof log was modified in the last 6 seconds
-    RECENT=0
-    LOG=/var/mobile/Downloads/ue4_overlay_v3_proof.log
-    if [ -f "$LOG" ]; then
-        NOW=$(date +%s)
-        MOD=$(stat -c %Y "$LOG" 2>/dev/null || stat -f %m "$LOG" 2>/dev/null || echo 0)
-        case "$MOD" in ''|*[!0-9]*) MOD=0 ;; esac
-        DIFF=$(( NOW - MOD ))
-        if [ "$DIFF" -ge 0 ] && [ "$DIFF" -le 6 ]; then
-            RECENT=1
-        fi
-    fi
-    RECORDED=""
-    if [ -f /var/mobile/Downloads/overlay_sb_pid.txt ]; then
-        RECORDED=$(cat /var/mobile/Downloads/overlay_sb_pid.txt 2>/dev/null)
-    fi
-
-    if [ "{force_flag}" = "0" ] && [ "$RECENT" = "1" ]; then
-        echo "ALREADY_ACTIVE $SB"
-    elif [ "{force_flag}" = "0" ] && [ -n "$RECORDED" ] && [ "$SB" = "$RECORDED" ]; then
-        echo "ALREADY_ACTIVE $SB"
-    else
-        echo "INJECTING_NOW $SB"
-        /var/jb/basebin/jbctl proc_set_debugged "$SB" 2>&1 || true
-        /var/jb/basebin/opainject "$SB" /var/jb/usr/lib/TweakInject/radar_overlay.dylib 2>&1 || true
-        echo "$SB" > /var/mobile/Downloads/overlay_sb_pid.txt
-    fi
+    exit 0
 fi
+RECORDED=$(cat /var/mobile/Downloads/overlay_sb_pid.txt 2>/dev/null)
+if [ -n "$RECORDED" ] && [ "$SB" = "$RECORDED" ]; then
+    echo "ALREADY_ACTIVE $SB"
+    exit 0
+fi
+# Wait up to 3s for newly spawned SpringBoard to initialize overlay
+for i in 1 2 3; do
+    sleep 1
+    RECORDED=$(cat /var/mobile/Downloads/overlay_sb_pid.txt 2>/dev/null)
+    if [ -n "$RECORDED" ] && [ "$SB" = "$RECORDED" ]; then
+        echo "ALREADY_ACTIVE $SB"
+        exit 0
+    fi
+done
+echo "NOT_LOADED $SB"
 """
-    res = remote(script, timeout=25)
+    res = remote(check_script, timeout=15)
     if "ALREADY_ACTIVE" in res:
         print("    [+] Overlay is already active in current SpringBoard.", flush=True)
-    elif "INJECTING_NOW" in res:
-        print("    [+] Overlay successfully injected into SpringBoard!", flush=True)
-        for line in res.splitlines():
-            line = line.strip()
-            if "dlopen succeeded" in line or "Overlay initialized" in line or "SERVER_TOUCH" in line:
-                print(f"        [+] {line}", flush=True)
+        return True
+    elif "NOT_LOADED" in res:
+        print("    [*] Overlay not active in current SpringBoard. Reloading SpringBoard cleanly via sbreload...", flush=True)
+        exit_safe_mode()
+        return True
     return True
+
 
 
 def do_restart(clean_game=True, respring_overlay=False):
@@ -272,6 +308,7 @@ test -s /var/jb/usr/lib/TweakInject/radar_overlay.plist
         print("    [R] -> Instant Restart (Kills stuck game, resets daemon, relaunches)")
         print("    [S] -> Soft Respring (Safely reloads SpringBoard & ESP overlay)")
         print("    [O] -> Verify Overlay (Checks active status / re-injects if idle)")
+        print("    [E] -> Exit Safe Mode (Clears .safe_mode and cleanly resprings SpringBoard)")
         print("    [T] -> Telemetry Stream (Live real-time tick, enemy count, aim lock)")
         print("    [F] -> Test Touch Injection (Fires a test swipe stroke on screen)")
         print("    [L] -> View Recent Logs (Tail daemon & overlay proof logs)")
@@ -280,7 +317,7 @@ test -s /var/jb/usr/lib/TweakInject/radar_overlay.plist
         print("    [Q] -> Quit Launcher")
         print("-" * 64)
         try:
-            choice = input("Enter action [R/S/O/T/F/L/P/K/Q] (default R): ").strip().upper()
+            choice = input("Enter action [R/S/O/E/T/F/L/P/K/Q] (default R): ").strip().upper()
         except (EOFError, KeyboardInterrupt):
             break
 
@@ -299,6 +336,8 @@ test -s /var/jb/usr/lib/TweakInject/radar_overlay.plist
         elif choice == "O":
             print("\n[*] Checking overlay status in current SpringBoard...", flush=True)
             ensure_overlay(force=False)
+        elif choice == "E":
+            exit_safe_mode()
         elif choice == "T":
             show_telemetry_stream()
         elif choice == "F":

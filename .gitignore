@@ -5,3 +5,13 @@ minimal_test.dylib
 *.tmp
 start_usb.log
 tools/codex_exec_*.sh
+*.ips
+*.raw
+*.patch
+dev_screen.png
+*_bin
+tests/inspect_ax_methods
+tests/test_ax_orientation
+tests/test_inject_touch
+tools/probe_attrs
+tools/probe_symbols

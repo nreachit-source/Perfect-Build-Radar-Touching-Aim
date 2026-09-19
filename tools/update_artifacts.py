@@ -21,13 +21,13 @@ def main():
 
     manifest = {
         "version": "1.3.4",
-        "build": "server-passthrough-20260914",
+        "build": "touch-delivery-20260919",
         "sha256": {
             "ue4loadmonitor": d_hash,
             "radar_overlay.dylib": o_hash,
         },
         "source": "source/overlay/radar_overlay.m",
-        "note": "Signed binaries retrieved from the phone; Mach-O sections match build_codex."
+        "note": "Signed artifacts match installed device SHA-256. Build and dispatch checks passed; foreground touch delivery awaits gameplay verification."
     }
     (art / "build.json").write_text(json.dumps(manifest, indent=2) + "\n", newline="\n")
     print("Updated artifacts/SHA256SUMS and artifacts/build.json")

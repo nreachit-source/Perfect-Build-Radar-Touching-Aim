@@ -73,6 +73,8 @@ static id    (*fn_objc_msgSend)(id self, SEL op, ...) = NULL;
 static SEL   (*fn_sel_registerName)(const char *str) = NULL;
 static Class (*fn_object_getClass)(id obj) = NULL;
 static const char *(*fn_class_getName)(Class cls) = NULL;
+static void *(*fn_objc_autoreleasePoolPush)(void) = NULL;
+static void  (*fn_objc_autoreleasePoolPop)(void *ctx) = NULL;
 
 #define objc_getClass fn_objc_getClass
 #define objc_allocateClassPair fn_objc_allocateClassPair
@@ -82,6 +84,8 @@ static const char *(*fn_class_getName)(Class cls) = NULL;
 #define sel_registerName fn_sel_registerName
 #define object_getClass fn_object_getClass
 #define class_getName fn_class_getName
+#define objc_autoreleasePoolPush fn_objc_autoreleasePoolPush
+#define objc_autoreleasePoolPop fn_objc_autoreleasePoolPop
 
 /* CoreGraphics geometry types */
 typedef double CGFloat;
@@ -93,6 +97,15 @@ static inline CGRect CGRectMake_f(CGFloat x, CGFloat y, CGFloat w, CGFloat h) {
     CGRect r = {{x, y}, {w, h}};
     return r;
 }
+
+static inline CGPoint CGPointMake_f(CGFloat x, CGFloat y) {
+    CGPoint p = {x, y};
+    return p;
+}
+
+static id nsstr(const char *s);
+static double g_screen_w = 0.0;
+static double g_screen_h = 0.0;
 
 static inline BOOL in_rect(CGPoint p, CGRect r) {
     return p.x >= r.origin.x && p.y >= r.origin.y &&
@@ -136,6 +149,7 @@ typedef void* IOHIDEventRef;
 typedef void* IOHIDEventSystemClientRef;
 typedef const void* CFAllocatorRef;
 typedef void* CFTypeRef;
+typedef void* CFStringRef;
 
 static IOHIDEventSystemClientRef (*fn_IOHIDEventSystemClientCreate)(CFAllocatorRef) = NULL;
 static void (*fn_IOHIDEventSystemClientDispatchEvent)(IOHIDEventSystemClientRef, IOHIDEventRef) = NULL;
@@ -145,29 +159,57 @@ static IOHIDEventRef (*fn_IOHIDEventCreateDigitizerEvent)(
 static IOHIDEventRef (*fn_IOHIDEventCreateDigitizerFingerEvent)(
     CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t,
     double, double, double, double, double, bool, bool, uint32_t) = NULL;
-static void (*fn_IOHIDEventAppendEvent)(IOHIDEventRef, IOHIDEventRef) = NULL;
+static void (*fn_IOHIDEventAppendEvent)(IOHIDEventRef, IOHIDEventRef, uint32_t) = NULL;
 static void (*fn_IOHIDEventSetSenderID)(IOHIDEventRef, uint64_t) = NULL;
+static void (*fn_IOHIDEventSetIntegerValue)(IOHIDEventRef, uint32_t, int) = NULL;
+static void (*fn_IOHIDEventSetFloatValue)(IOHIDEventRef, uint32_t, double) = NULL;
 static void (*fn_CFRelease)(CFTypeRef) = NULL;
+static CFStringRef (*fn_CFStringCreateWithCString)(CFAllocatorRef, const char *, uint32_t) = NULL;
+
+typedef void* IOHIDServiceClientRef;
+typedef void* CFArrayRef;
+typedef long CFIndex;
+
+static CFArrayRef (*fn_IOHIDEventSystemClientCopyServices)(IOHIDEventSystemClientRef) = NULL;
+static CFTypeRef (*fn_IOHIDServiceClientCopyProperty)(IOHIDServiceClientRef, CFStringRef) = NULL;
+static CFTypeRef (*fn_IOHIDServiceClientGetRegistryID)(IOHIDServiceClientRef) = NULL;
+static CFIndex (*fn_CFArrayGetCount)(CFArrayRef) = NULL;
+static const void* (*fn_CFArrayGetValueAtIndex)(CFArrayRef, CFIndex) = NULL;
+static bool (*fn_CFNumberGetValue)(CFTypeRef, int, void *) = NULL;
+
+static void update_digitizer_sender_id(void);
 
 static IOHIDEventSystemClientRef g_hid_client = NULL;
+static id g_ax_server = nil;
+static Class g_cls_ax_event = nil;
+static uint64_t g_touch_sender_id = 0;
 static uint32_t g_touch_finger_id = 9;
+static double g_panel_w = 375.0, g_panel_h = 812.0;
+static BOOL drawn_point_to_panel(double x, double y, double *hx, double *hy);
 static BOOL g_sim_touch_down = NO;
 static NSInteger g_current_orientation = 3; /* 1=Portrait, 2=UpsideDown, 3=LandscapeRight, 4=LandscapeLeft */
 static uint32_t g_draws = 0;
 static FILE *g_proof = NULL;
+static radar_shared_t g_snapshot;
 
 static void screen_to_digitizer_coords(double scr_x, double scr_y, double *out_hid_x, double *out_hid_y) {
+    if (drawn_point_to_panel(scr_x, scr_y, out_hid_x, out_hid_y)) return;
     NSInteger ori = g_current_orientation;
-    if (ori != 1 && ori != 2 && ori != 4) ori = 3; /* Default to LandscapeRight for shooter gameplay */
+    /* In live gameplay tracking or when camera is valid, enforce landscape */
+    if (g_snapshot.header.status == 2 && g_snapshot.header.camera_valid) {
+        if (ori != 4) ori = 3; /* LandscapeRight */
+    } else {
+        if (ori != 1 && ori != 2 && ori != 4) ori = 3; /* Default LandscapeRight */
+    }
 
     double hx = scr_x, hy = scr_y;
     if (ori == 3) {
-        /* LandscapeRight: USB port on right, notch on left */
-        hx = scr_y;
+        /* LandscapeRight: USB port on right, notch on left (panel X = 1.0 - scr_y, panel Y = scr_x) */
+        hx = 1.0 - scr_y;
         hy = scr_x;
     } else if (ori == 4) {
-        /* LandscapeLeft: USB port on left, notch on right */
-        hx = 1.0 - scr_y;
+        /* LandscapeLeft: USB port on left, notch on right (panel X = scr_y, panel Y = 1.0 - scr_x) */
+        hx = scr_y;
         hy = 1.0 - scr_x;
     } else if (ori == 2) {
         /* PortraitUpsideDown */
@@ -212,19 +254,117 @@ static void resolve_cg_symbols(void) {
     fn_sel_registerName             = (SEL (*)(const char *))dlsym(RTLD_DEFAULT, "sel_registerName");
     fn_object_getClass              = (Class (*)(id))dlsym(RTLD_DEFAULT, "object_getClass");
     fn_class_getName                = (const char *(*)(Class))dlsym(RTLD_DEFAULT, "class_getName");
+    fn_objc_autoreleasePoolPush     = (void *(*)(void))dlsym(RTLD_DEFAULT, "objc_autoreleasePoolPush");
+    fn_objc_autoreleasePoolPop      = (void (*)(void *))dlsym(RTLD_DEFAULT, "objc_autoreleasePoolPop");
 
     void *hIOKit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_GLOBAL | RTLD_NOW);
     void *hCF = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_GLOBAL | RTLD_NOW);
+    dlopen("/System/Library/PrivateFrameworks/AccessibilityUtilities.framework/AccessibilityUtilities", RTLD_GLOBAL | RTLD_NOW);
+    dlopen("/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime", RTLD_GLOBAL | RTLD_NOW);
+
     if (hIOKit) {
         fn_IOHIDEventSystemClientCreate = (IOHIDEventSystemClientRef (*)(CFAllocatorRef))dlsym(hIOKit, "IOHIDEventSystemClientCreate");
         fn_IOHIDEventSystemClientDispatchEvent = (void (*)(IOHIDEventSystemClientRef, IOHIDEventRef))dlsym(hIOKit, "IOHIDEventSystemClientDispatchEvent");
         fn_IOHIDEventCreateDigitizerEvent = (IOHIDEventRef (*)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double, double, double, double, bool, bool, uint32_t))dlsym(hIOKit, "IOHIDEventCreateDigitizerEvent");
         fn_IOHIDEventCreateDigitizerFingerEvent = (IOHIDEventRef (*)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, double, double, double, double, double, bool, bool, uint32_t))dlsym(hIOKit, "IOHIDEventCreateDigitizerFingerEvent");
-        fn_IOHIDEventAppendEvent = (void (*)(IOHIDEventRef, IOHIDEventRef))dlsym(hIOKit, "IOHIDEventAppendEvent");
+        fn_IOHIDEventAppendEvent = (void (*)(IOHIDEventRef, IOHIDEventRef, uint32_t))dlsym(hIOKit, "IOHIDEventAppendEvent");
         fn_IOHIDEventSetSenderID = (void (*)(IOHIDEventRef, uint64_t))dlsym(hIOKit, "IOHIDEventSetSenderID");
+        fn_IOHIDEventSetIntegerValue = (void (*)(IOHIDEventRef, uint32_t, int))dlsym(hIOKit, "IOHIDEventSetIntegerValue");
+        fn_IOHIDEventSetFloatValue = (void (*)(IOHIDEventRef, uint32_t, double))dlsym(hIOKit, "IOHIDEventSetFloatValue");
+    }
+    if (hIOKit) {
+        fn_IOHIDEventSystemClientCopyServices = (CFArrayRef (*)(IOHIDEventSystemClientRef))dlsym(hIOKit, "IOHIDEventSystemClientCopyServices");
+        fn_IOHIDServiceClientCopyProperty = (CFTypeRef (*)(IOHIDServiceClientRef, CFStringRef))dlsym(hIOKit, "IOHIDServiceClientCopyProperty");
+        fn_IOHIDServiceClientGetRegistryID = (CFTypeRef (*)(IOHIDServiceClientRef))dlsym(hIOKit, "IOHIDServiceClientGetRegistryID");
     }
     if (hCF) {
         fn_CFRelease = (void (*)(CFTypeRef))dlsym(hCF, "CFRelease");
+        fn_CFStringCreateWithCString = (CFStringRef (*)(CFAllocatorRef, const char *, uint32_t))dlsym(hCF, "CFStringCreateWithCString");
+        fn_CFArrayGetCount = (CFIndex (*)(CFArrayRef))dlsym(hCF, "CFArrayGetCount");
+        fn_CFArrayGetValueAtIndex = (const void* (*)(CFArrayRef, CFIndex))dlsym(hCF, "CFArrayGetValueAtIndex");
+        fn_CFNumberGetValue = (bool (*)(CFTypeRef, int, void *))dlsym(hCF, "CFNumberGetValue");
+    }
+    update_digitizer_sender_id();
+
+    Class cls_AXBackBoard = objc_getClass("AXBackBoardServer");
+    if (cls_AXBackBoard) {
+        g_ax_server = ((id (*)(id, SEL))objc_msgSend)((id)cls_AXBackBoard, sel_registerName("server"));
+        if (!g_ax_server) {
+            g_ax_server = ((id (*)(id, SEL))objc_msgSend)((id)cls_AXBackBoard, sel_registerName("sharedInstance"));
+        }
+        if (g_ax_server) {
+            ((void (*)(id, SEL, int))objc_msgSend)(g_ax_server, sel_registerName("registerAssistiveTouchPID:"), getpid());
+        }
+    }
+    g_cls_ax_event = objc_getClass("AXEventRepresentation");
+}
+
+static inline BOOL safe_responds(id obj, const char *sel_name) {
+    if (!obj) return NO;
+    SEL s = sel_registerName(sel_name);
+    return ((BOOL (*)(id, SEL, SEL))objc_msgSend)(obj, sel_registerName("respondsToSelector:"), s);
+}
+
+static void update_digitizer_sender_id(void) {
+    if (!fn_IOHIDEventSystemClientCreate || !fn_IOHIDEventSystemClientCopyServices ||
+        !fn_IOHIDServiceClientCopyProperty || !fn_IOHIDServiceClientGetRegistryID ||
+        !fn_CFArrayGetCount || !fn_CFArrayGetValueAtIndex || !fn_CFRelease ||
+        !fn_CFStringCreateWithCString || !fn_CFNumberGetValue) return;
+
+    IOHIDEventSystemClientRef client = fn_IOHIDEventSystemClientCreate(NULL);
+    if (!client) return;
+
+    CFStringRef kPage = fn_CFStringCreateWithCString(NULL, "PrimaryUsagePage", 0x08000100);
+    CFStringRef kUsage = fn_CFStringCreateWithCString(NULL, "PrimaryUsage", 0x08000100);
+
+    CFArrayRef services = fn_IOHIDEventSystemClientCopyServices(client);
+    if (services) {
+        CFIndex count = fn_CFArrayGetCount(services);
+        for (CFIndex i = 0; i < count; i++) {
+            IOHIDServiceClientRef s = (IOHIDServiceClientRef)fn_CFArrayGetValueAtIndex(services, i);
+            int page = 0, usage = 0;
+            CFTypeRef pPage = fn_IOHIDServiceClientCopyProperty(s, kPage);
+            if (pPage) {
+                fn_CFNumberGetValue(pPage, 3 /* kCFNumberSInt32Type */, &page);
+                fn_CFRelease(pPage);
+            }
+            CFTypeRef pUsage = fn_IOHIDServiceClientCopyProperty(s, kUsage);
+            if (pUsage) {
+                fn_CFNumberGetValue(pUsage, 3 /* kCFNumberSInt32Type */, &usage);
+                fn_CFRelease(pUsage);
+            }
+            if (page == 0x0D && usage == 0x04) {
+                CFTypeRef registry_number = fn_IOHIDServiceClientGetRegistryID(s);
+                uint64_t reg = 0;
+                /* GetRegistryID returns a borrowed CFNumber, not its integer value. */
+                if (registry_number && fn_CFNumberGetValue(registry_number, 4 /* SInt64 */, &reg) && reg != 0) {
+                    g_touch_sender_id = reg;
+                    break;
+                }
+            }
+        }
+        fn_CFRelease(services);
+    }
+    if (kPage) fn_CFRelease(kPage);
+    if (kUsage) fn_CFRelease(kUsage);
+    fn_CFRelease(client);
+}
+
+static void ensure_screen_awake_and_unlocked(void) {
+    Class SBLockScreenManager = objc_getClass("SBLockScreenManager");
+    if (SBLockScreenManager && safe_responds((id)SBLockScreenManager, "sharedInstance")) {
+        id lsm = ((id (*)(id, SEL))objc_msgSend)((id)SBLockScreenManager, sel_registerName("sharedInstance"));
+        if (lsm && safe_responds(lsm, "unlockUIFromSource:withOptions:")) {
+            ((void (*)(id, SEL, int, id))objc_msgSend)(lsm, sel_registerName("unlockUIFromSource:withOptions:"), 0, (id)0);
+        }
+    }
+
+    Class SBBacklightController = objc_getClass("SBBacklightController");
+    if (SBBacklightController && safe_responds((id)SBBacklightController, "sharedInstance")) {
+        id bl = ((id (*)(id, SEL))objc_msgSend)((id)SBBacklightController, sel_registerName("sharedInstance"));
+        if (bl && safe_responds(bl, "turnOnScreenFullyWithReason:")) {
+            ((void (*)(id, SEL, id))objc_msgSend)(bl, sel_registerName("turnOnScreenFullyWithReason:"), nsstr("WakeDevice"));
+        }
     }
 }
 
@@ -236,27 +376,6 @@ static void ensure_hid_client(void) {
 }
 
 static void hid_touch_event(double norm_x, double norm_y, int touch_state) {
-    ensure_hid_client();
-    if (!g_hid_client || !fn_IOHIDEventCreateDigitizerEvent ||
-        !fn_IOHIDEventCreateDigitizerFingerEvent || !fn_IOHIDEventAppendEvent ||
-        !fn_IOHIDEventSystemClientDispatchEvent) return;
-
-    uint64_t now = mach_absolute_time();
-    uint32_t mask = 0;
-    bool is_down = false;
-    if (touch_state == 1) { /* Down */
-        mask = 0x03; /* Range | Touch */
-        is_down = true;
-        g_sim_touch_down = YES;
-    } else if (touch_state == 2) { /* Move */
-        mask = 0x07; /* Range | Touch | Position */
-        is_down = true;
-        g_sim_touch_down = YES;
-    } else { /* Up */
-        mask = 0x01; /* Range only (lift) */
-        is_down = false;
-        g_sim_touch_down = NO;
-    }
     if (norm_x < 0.03) norm_x = 0.03;
     if (norm_x > 0.97) norm_x = 0.97;
     if (norm_y < 0.03) norm_y = 0.03;
@@ -265,29 +384,100 @@ static void hid_touch_event(double norm_x, double norm_y, int touch_state) {
     double hid_x, hid_y;
     screen_to_digitizer_coords(norm_x, norm_y, &hid_x, &hid_y);
 
-    IOHIDEventRef parent = fn_IOHIDEventCreateDigitizerEvent(
-        NULL, now, 0x23 /* Hand */, 0, 0, mask, 0,
-        hid_x, hid_y, 0.0, is_down ? 1.0 : 0.0, 0.0,
-        is_down, is_down, 0);
+    /* Physical portrait panel coordinates on iPhone X (375x812) */
+    double port_px = hid_x * g_panel_w;
+    double port_py = hid_y * g_panel_h;
 
-    IOHIDEventRef finger = fn_IOHIDEventCreateDigitizerFingerEvent(
-        NULL, now, 1, g_touch_finger_id, mask,
-        hid_x, hid_y, 0.0, is_down ? 1.0 : 0.0, 0.0,
-        is_down, is_down, 0);
+    CGPoint touch_pt = CGPointMake_f(port_px, port_py);
 
-    if (parent && finger) {
-        fn_IOHIDEventAppendEvent(parent, finger);
-        if (fn_IOHIDEventSetSenderID) {
-            fn_IOHIDEventSetSenderID(parent, 0x8000000817319372ULL);
-        }
-        fn_IOHIDEventSystemClientDispatchEvent(g_hid_client, parent);
+    unsigned int hand_type = 1;
+    uint32_t f_mask = 3;
+    bool f_down = false;
+    if (touch_state == 1) {
+        hand_type = 1; /* Touched (Down) */
+        f_mask = 3;    /* Touch | Range */
+        f_down = true;
+        g_sim_touch_down = YES;
+    } else if (touch_state == 2) {
+        hand_type = 2; /* Moved */
+        f_mask = 4;    /* Position */
+        f_down = true;
+        g_sim_touch_down = YES;
+    } else {
+        hand_type = 6; /* Lifted (Up) */
+        f_mask = 3;    /* Range and touch both leave the display. */
+        f_down = false;
+        g_sim_touch_down = NO;
     }
-    if (finger && fn_CFRelease) fn_CFRelease(finger);
-    if (parent && fn_CFRelease) fn_CFRelease(parent);
 
-    if (g_proof && (touch_state == 1 || touch_state == 0 || g_draws % 30 == 0)) {
-        fprintf(g_proof, "TOUCH_EVENT: state=%d scr=(%.3f,%.3f) hid=(%.3f,%.3f) ori=%ld down=%d\n",
-                touch_state, norm_x, norm_y, hid_x, hid_y, (long)g_current_orientation, g_sim_touch_down);
+    /* 1. Accessibility Touch Injection via AXBackBoardServer (User requested outside accessibility touch) */
+    if (g_cls_ax_event && g_ax_server) {
+        if (safe_responds((id)g_cls_ax_event, "touchRepresentationWithHandType:location:")) {
+            id rep = ((id (*)(id, SEL, unsigned int, CGPoint))objc_msgSend)(
+                (id)g_cls_ax_event, sel_registerName("touchRepresentationWithHandType:location:"), hand_type, touch_pt);
+            if (rep) {
+                if (safe_responds(rep, "setIsGeneratedEvent:")) {
+                    ((void (*)(id, SEL, BOOL))objc_msgSend)(rep, sel_registerName("setIsGeneratedEvent:"), YES);
+                }
+                if (safe_responds(g_ax_server, "postEvent:systemEvent:")) {
+                    ((void (*)(id, SEL, id, BOOL))objc_msgSend)(g_ax_server, sel_registerName("postEvent:systemEvent:"), rep, NO);
+                }
+            }
+        }
+    }
+
+    /* 2. Raw IOHIDEvent digitizer transducer conforming to ZXTouch/SimulateTouch iOS 16 spec */
+    ensure_hid_client();
+    if (fn_IOHIDEventCreateDigitizerEvent && fn_IOHIDEventCreateDigitizerFingerEvent && fn_IOHIDEventAppendEvent && g_hid_client && g_touch_sender_id) {
+        uint64_t now = mach_absolute_time();
+
+        IOHIDEventRef parent = fn_IOHIDEventCreateDigitizerEvent(
+            NULL, now, 3 /* Hand */, 99, 1, f_mask, 0,
+            hid_x, hid_y, 0.0, 0.0, 0.0, f_down, f_down, 0);
+
+        if (parent) {
+            if (fn_IOHIDEventSetIntegerValue) {
+                fn_IOHIDEventSetIntegerValue(parent, 720921 /* 0xb0019 */, 1); /* kIOHIDEventFieldDigitizerIsDisplayIntegrated */
+                fn_IOHIDEventSetIntegerValue(parent, 4 /* 0x4 */, 1);          /* kIOHIDEventFieldDigitizerEventMask */
+            }
+
+            IOHIDEventRef finger = fn_IOHIDEventCreateDigitizerFingerEvent(
+                NULL, now, g_touch_finger_id, 3, f_mask,
+                hid_x, hid_y, 0.0, 0.0, 0.0,
+                f_down ? 1 : 0, f_down ? 1 : 0, 0);
+
+            if (finger) {
+                if (fn_IOHIDEventSetFloatValue) {
+                    fn_IOHIDEventSetFloatValue(finger, 720916 /* 0xb0014 */, 0.04); /* major radius */
+                    fn_IOHIDEventSetFloatValue(finger, 720917 /* 0xb0015 */, 0.04); /* minor radius */
+                }
+                fn_IOHIDEventAppendEvent(parent, finger, 0);
+                if (fn_IOHIDEventSetSenderID && g_touch_sender_id) {
+                    fn_IOHIDEventSetSenderID(finger, g_touch_sender_id);
+                }
+                if (fn_CFRelease) fn_CFRelease(finger);
+            }
+
+            if (fn_IOHIDEventSetIntegerValue) {
+                fn_IOHIDEventSetIntegerValue(parent, 720903 /* event mask */, f_mask);
+                fn_IOHIDEventSetIntegerValue(parent, 720904 /* range */, f_down);
+                fn_IOHIDEventSetIntegerValue(parent, 720905 /* touch */, f_down);
+            }
+
+            if (fn_IOHIDEventSetSenderID && g_touch_sender_id) {
+                fn_IOHIDEventSetSenderID(parent, g_touch_sender_id);
+            }
+
+            if (fn_IOHIDEventSystemClientDispatchEvent) {
+                fn_IOHIDEventSystemClientDispatchEvent(g_hid_client, parent);
+            }
+            if (fn_CFRelease) fn_CFRelease(parent);
+        }
+    }
+
+    if (g_proof && (touch_state == 1 || touch_state == 0 || g_draws % 15 == 0)) {
+        fprintf(g_proof, "TOUCH_EVENT: state=%d norm=(%.3f,%.3f) port=(%.1f,%.1f) ori=%ld down=%d sender=0x%llx\n",
+                touch_state, norm_x, norm_y, port_px, port_py, (long)g_current_orientation, g_sim_touch_down, (unsigned long long)g_touch_sender_id);
         fflush(g_proof);
     }
 }
@@ -296,6 +486,13 @@ static id nsstr(const char *s) {
     if (!fn_objc_getClass) resolve_cg_symbols();
     return ((id (*)(id, SEL, const char *))objc_msgSend)(
         (id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), s);
+}
+
+static id retain_obj(id obj) {
+    if (obj) {
+        return ((id (*)(id, SEL))objc_msgSend)(obj, sel_registerName("retain"));
+    }
+    return nil;
 }
 
 /* ------------------------------------------------------------------ */
@@ -308,7 +505,6 @@ static id nsstr(const char *s) {
 
 static int             g_shm_fd     = -1;
 static radar_shared_t *g_shared     = NULL;
-static radar_shared_t  g_snapshot;
 static uint32_t        g_last_tick  = 0;
 static double          g_changed_at = 0;
 static uint32_t        s_overlay_local_team = 0;
@@ -319,15 +515,32 @@ static id g_button_window = nil, g_menu_window = nil, g_aim_window = nil;
 static void layout_controls(void);
 static id g_window          = nil;
 static id g_esp_view        = nil;
+/* Convert the same local point used by drawRect through the actual view transform.
+ * UIScreen.fixedCoordinateSpace stays portrait regardless of scene orientation. */
+static BOOL drawn_point_to_panel(double x, double y, double *hx, double *hy) {
+    if (!g_esp_view || !safe_responds(g_esp_view, "convertPoint:toCoordinateSpace:")) return NO;
+    id screen = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIScreen"), sel_registerName("mainScreen"));
+    if (!safe_responds(screen, "fixedCoordinateSpace")) return NO;
+    id fixed = ((id (*)(id, SEL))objc_msgSend)(screen, sel_registerName("fixedCoordinateSpace"));
+    if (!fixed) return NO;
+    CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(g_esp_view, sel_registerName("bounds"));
+    CGRect panel = ((CGRect (*)(id, SEL))objc_msgSend)(fixed, sel_registerName("bounds"));
+    if (bounds.size.width <= 0 || bounds.size.height <= 0 || panel.size.width <= 0 || panel.size.height <= 0) return NO;
+    CGPoint local = CGPointMake_f(x * bounds.size.width, y * bounds.size.height);
+    CGPoint pt = ((CGPoint (*)(id, SEL, CGPoint, id))objc_msgSend)(g_esp_view, sel_registerName("convertPoint:toCoordinateSpace:"), local, fixed);
+    if (!isfinite(pt.x) || !isfinite(pt.y)) return NO;
+    g_panel_w = panel.size.width;
+    g_panel_h = panel.size.height;
+    *hx = (pt.x - panel.origin.x) / g_panel_w;
+    *hy = (pt.y - panel.origin.y) / g_panel_h;
+    return YES;
+}
+
 static id g_radar_view      = nil;
 static id g_drag_button     = nil;
 static id g_aim_button      = nil;
 static id g_menu_view       = nil;
 static id g_menu_footer     = nil;
-
-/* Screen tracking for dynamic orientation adaptation */
-static double g_screen_w = 0.0;
-static double g_screen_h = 0.0;
 
 /* UI Rects for hit testing */
 static CGRect g_button_rect = {{16, 50}, {48, 48}};
@@ -346,44 +559,75 @@ static CGPoint g_locked_screen_pos = {0, 0};
 static double  g_sim_norm_x = 0.72;
 static double  g_sim_norm_y = 0.50;
 static int     g_sim_stroke_frames = 0;
+static int     g_sim_recenter_pause = 0;
 
 /* 24 Interactive Feature Flags */
-static BOOL g_feat_radar          = YES;
-static BOOL g_feat_lines          = YES;
-static BOOL g_feat_box            = YES;
-static BOOL g_feat_health         = YES;
-static BOOL g_feat_name           = YES;
-static BOOL g_feat_dist           = YES;
-static BOOL g_feat_team_bot       = YES;
-static BOOL g_feat_skeleton       = YES;
-static BOOL g_feat_head           = YES;
-static BOOL g_feat_vehicles       = YES;
-static BOOL g_feat_items          = YES;
+static BOOL g_feat_radar          = NO;   /* Radar Minimap OFF */
+static BOOL g_feat_lines          = NO;   /* Snaplines OFF */
+static BOOL g_feat_box            = YES;  /* 2D Bounding Box ESP ON */
+static BOOL g_feat_health         = NO;   /* Health Bar OFF */
+static BOOL g_feat_name           = YES;  /* Player Name ESP ON */
+static BOOL g_feat_dist           = NO;   /* Distance OFF */
+static BOOL g_feat_team_bot       = YES;  /* Team ID & Bot Badge ON */
+static BOOL g_feat_skeleton       = NO;   /* Skeleton OFF */
+static BOOL g_feat_head           = NO;   /* Head Dot OFF */
+static BOOL g_feat_vehicles       = NO;   /* Vehicles OFF */
+static BOOL g_feat_items          = NO;   /* Loot ESP OFF */
 static int  g_radar_range         = 200; /* 100, 200, 400 meters */
 /* 12 Advanced Features (24 Total) */
-static BOOL g_feat_touch_aim      = YES;  /* Outside Screen Touch Auto-Aim */
+static BOOL g_feat_touch_aim      = YES;  /* Outside Screen Touch Auto-Aim ON */
 static int  g_aim_velocity        = 1;    /* 0=Slow 20%, 1=Med 45%, 2=Fast 75%, 3=Max 100% */
 static int  g_aim_bone            = 0;    /* 0=Head, 1=Chest */
-static BOOL g_feat_aim_fov        = YES;  /* Aim FOV Targeting Circle */
+static BOOL g_feat_aim_fov        = NO;   /* Aim FOV Targeting Circle OFF */
 static int  g_aim_fov_mode        = 1;    /* 0=100pt, 1=180pt, 2=260pt, 3=350pt, 4=Max/Full */
 static int  g_aim_trigger_mode    = 1;    /* 0=Hold Button, 1=Auto FOV (Default), 2=OFF */
 static int  g_aim_touch_zone      = 1;    /* 0=Left 1/3, 1=Right Look (Default), 2=Center */
-static BOOL g_feat_veh_air_only   = YES;  /* Vehicles: Airplane Detection (filters cars by default) */
-static BOOL g_feat_item_filter    = NO;   /* Item Filter: High Tier / Grenades / Smokes only */
-static BOOL g_feat_teammates      = YES;  /* Teammate ESP Display (friendly green) */
-static BOOL g_feat_enemy_alert    = YES;  /* Enemy Count & Danger Warning Alert */
-static BOOL g_feat_offscreen_arrows = YES;/* Off-screen Radar Direction Arrows */
-static BOOL g_feat_crosshair      = YES;  /* Center Tactical Precision Crosshair */
-static BOOL g_feat_target_lock    = YES;  /* Target Lock Reticle & Aim Tracer */
+static BOOL g_feat_veh_air_only   = NO;   /* Vehicles: Airplane Detection OFF */
+static BOOL g_feat_item_filter    = NO;   /* Item Filter OFF */
+static BOOL g_feat_teammates      = NO;   /* Teammate ESP Display OFF */
+static BOOL g_feat_enemy_alert    = NO;   /* Enemy Count & Danger Warning Alert OFF */
+static BOOL g_feat_offscreen_arrows = NO; /* Off-screen Radar Direction Arrows OFF */
+static BOOL g_feat_crosshair      = NO;   /* Center Tactical Precision Crosshair OFF */
+static BOOL g_feat_target_lock    = NO;   /* Target Lock Reticle & Aim Tracer OFF */
+/* 14 New Creative High-Impact Features (38 Total) */
+static BOOL g_feat_lead_pred       = NO;  /* 1. Target Lead Prediction Dot OFF */
+static BOOL g_feat_bullet_drop     = NO;  /* 2. Sniper Bullet Drop Arc OFF */
+static BOOL g_feat_recoil_comp     = NO;  /* 3. Weapon Recoil Compensation OFF */
+static BOOL g_feat_gaze_ray        = NO;  /* 4. Enemy Line-of-Sight Gaze Tracer OFF */
+static BOOL g_feat_blindspot_alert = NO;  /* 5. Behind-Back Blindspot Danger Warning OFF */
+static BOOL g_feat_spectator_warn  = NO;  /* 6. Spectator Count & Surveillance Alert OFF */
+static BOOL g_feat_adaptive_fov    = NO;  /* 7. Distance-Adaptive FOV Auto-Scaling OFF */
+static BOOL g_feat_threat_tier     = NO;  /* 8. Bot vs Real Player Threat Ranking OFF */
+static BOOL g_feat_grenade_warn    = NO;  /* 9. Grenade & Explosive Danger Zone OFF */
+static BOOL g_feat_airdrop_beacon  = NO;  /* 10. Airdrop & Flare Crate Beacon ESP OFF */
+static BOOL g_feat_sound_radar     = NO;  /* 11. Sound / Footstep Radar Visualizer OFF */
+static BOOL g_feat_knocked_timer   = NO;  /* 12. Team Revive & Downed Player Bleed Timer OFF */
+static BOOL g_feat_auto_evade      = NO;  /* 13. Low HP Tactical Emergency Alert OFF */
+static BOOL g_feat_aim_smooth      = NO;  /* 14. Aim Smoothness Micro-Stroking OFF */
+
+/* Tracking state for ballistics velocity and lead calculation */
+typedef struct {
+    rvec3_t pos;
+    rvec3_t vel;
+    double  last_time;
+} player_tracking_t;
+static player_tracking_t g_tracked_players[RADAR_MAX_PLAYERS];
 
 static inline double get_aim_fov_radius(double screen_w, double screen_h) {
+    double r = 180.0;
     switch (g_aim_fov_mode) {
-        case 0: return 100.0;
-        case 1: return 180.0;
-        case 2: return 260.0;
-        case 3: return 350.0;
-        default: return fmin(screen_w, screen_h) * 0.48;
+        case 0: r = 100.0; break;
+        case 1: r = 180.0; break;
+        case 2: r = 260.0; break;
+        case 3: r = 350.0; break;
+        default: r = fmin(screen_w, screen_h) * 0.48; break;
     }
+    if (g_feat_adaptive_fov && g_locked_player_idx >= 0 && (uint32_t)g_locked_player_idx < g_snapshot.header.player_count) {
+        float d = g_snapshot.players[g_locked_player_idx].distance;
+        if (d > 120.0f) r *= 0.65;      /* Tighten for long-range sniper accuracy */
+        else if (d < 35.0f) r *= 1.40;  /* Expand for close-range CQB */
+    }
+    return r;
 }
 
 static double g_finger_drag_x     = 0.0;  /* Interactive finger movement bias */
@@ -417,6 +661,21 @@ static id g_btn_enemy_alert = nil;
 static id g_btn_offscreen   = nil;
 static id g_btn_crosshair   = nil;
 static id g_btn_target_lock = nil;
+/* 14 New Feature Buttons */
+static id g_btn_lead_pred       = nil;
+static id g_btn_bullet_drop     = nil;
+static id g_btn_recoil_comp     = nil;
+static id g_btn_gaze_ray        = nil;
+static id g_btn_blindspot_alert = nil;
+static id g_btn_spectator_warn  = nil;
+static id g_btn_adaptive_fov    = nil;
+static id g_btn_threat_tier     = nil;
+static id g_btn_grenade_warn    = nil;
+static id g_btn_airdrop_beacon  = nil;
+static id g_btn_sound_radar     = nil;
+static id g_btn_knocked_timer   = nil;
+static id g_btn_auto_evade      = nil;
+static id g_btn_aim_smooth      = nil;
 
 /* Typography & Colors cached */
 static id g_font_small  = nil;
@@ -546,6 +805,49 @@ static void update_menu_buttons(void) {
     title(g_btn_target_lock, g_feat_target_lock ? "Lock Box: ON" : "Lock Box: OFF");
     style_toggle_button(g_btn_target_lock, g_feat_target_lock);
 
+    /* 14 New Feature Toggles */
+    title(g_btn_lead_pred, g_feat_lead_pred ? "Lead Dot: ON" : "Lead Dot: OFF");
+    style_toggle_button(g_btn_lead_pred, g_feat_lead_pred);
+
+    title(g_btn_bullet_drop, g_feat_bullet_drop ? "Drop Guide: ON" : "Drop Guide: OFF");
+    style_toggle_button(g_btn_bullet_drop, g_feat_bullet_drop);
+
+    title(g_btn_recoil_comp, g_feat_recoil_comp ? "Recoil Comp: ON" : "Recoil Comp: OFF");
+    style_toggle_button(g_btn_recoil_comp, g_feat_recoil_comp);
+
+    title(g_btn_gaze_ray, g_feat_gaze_ray ? "Gaze Rays: ON" : "Gaze Rays: OFF");
+    style_toggle_button(g_btn_gaze_ray, g_feat_gaze_ray);
+
+    title(g_btn_blindspot_alert, g_feat_blindspot_alert ? "Blind Alert: ON" : "Blind Alert: OFF");
+    style_toggle_button(g_btn_blindspot_alert, g_feat_blindspot_alert);
+
+    title(g_btn_spectator_warn, g_feat_spectator_warn ? "Spectator: ON" : "Spectator: OFF");
+    style_toggle_button(g_btn_spectator_warn, g_feat_spectator_warn);
+
+    title(g_btn_adaptive_fov, g_feat_adaptive_fov ? "Adapt FOV: ON" : "Adapt FOV: OFF");
+    style_toggle_button(g_btn_adaptive_fov, g_feat_adaptive_fov);
+
+    title(g_btn_threat_tier, g_feat_threat_tier ? "Threat Rank: ON" : "Threat Rank: OFF");
+    style_toggle_button(g_btn_threat_tier, g_feat_threat_tier);
+
+    title(g_btn_grenade_warn, g_feat_grenade_warn ? "Nade Alert: ON" : "Nade Alert: OFF");
+    style_toggle_button(g_btn_grenade_warn, g_feat_grenade_warn);
+
+    title(g_btn_airdrop_beacon, g_feat_airdrop_beacon ? "Airdrop ESP: ON" : "Airdrop ESP: OFF");
+    style_toggle_button(g_btn_airdrop_beacon, g_feat_airdrop_beacon);
+
+    title(g_btn_sound_radar, g_feat_sound_radar ? "Audio Radar: ON" : "Audio Radar: OFF");
+    style_toggle_button(g_btn_sound_radar, g_feat_sound_radar);
+
+    title(g_btn_knocked_timer, g_feat_knocked_timer ? "Bleed Timer: ON" : "Bleed Timer: OFF");
+    style_toggle_button(g_btn_knocked_timer, g_feat_knocked_timer);
+
+    title(g_btn_auto_evade, g_feat_auto_evade ? "Evade Alert: ON" : "Evade Alert: OFF");
+    style_toggle_button(g_btn_auto_evade, g_feat_auto_evade);
+
+    title(g_btn_aim_smooth, g_feat_aim_smooth ? "Aim Smooth: ON" : "Aim Smooth: OFF");
+    style_toggle_button(g_btn_aim_smooth, g_feat_aim_smooth);
+
     hidden(g_radar_view, !g_feat_radar);
     if (g_aim_window) hidden(g_aim_window, !g_feat_touch_aim || g_menu_open);
 }
@@ -588,36 +890,74 @@ static void codex_action_toggle_menu_cls(id self, SEL cmd) {
 /*  Text Rendering Helper via NSString drawAtPoint                    */
 /* ------------------------------------------------------------------ */
 
+static id s_font_attr_key = nil;
+static id s_color_attr_key = nil;
+
+static void ensure_text_attrs(void) {
+    if (!s_font_attr_key) {
+        id *pFont = (id *)dlsym(RTLD_DEFAULT, "NSFontAttributeName");
+        if (pFont && *pFont) {
+            s_font_attr_key = retain_obj(*pFont);
+        } else {
+            s_font_attr_key = retain_obj(nsstr("NSFont"));
+        }
+    }
+    if (!s_color_attr_key) {
+        id *pColor = (id *)dlsym(RTLD_DEFAULT, "NSForegroundColorAttributeName");
+        if (pColor && *pColor) {
+            s_color_attr_key = retain_obj(*pColor);
+        } else {
+            s_color_attr_key = retain_obj(nsstr("NSColor"));
+        }
+    }
+}
+
 static void draw_text_at(const char *text, CGPoint pt, id font, id color) {
-    if (!text || text[0] == '\0' || !font || !color) return;
+    if (!text || text[0] == '\0') return;
+    if (!font) font = g_font_small;
+    if (!color) color = g_color_white;
+    if (!font || !color) return;
+
     id s = nsstr(text);
     if (!s) return;
 
+    ensure_text_attrs();
+    if (!s_font_attr_key || !s_color_attr_key) return;
+
     Class dict_cls = objc_getClass("NSDictionary");
-    id font_key = nsstr("NSFont");
-    id color_key = nsstr("NSColor");
+    if (!dict_cls) return;
+
     id objects[2] = { font, color };
-    id keys[2] = { font_key, color_key };
+    id keys[2] = { s_font_attr_key, s_color_attr_key };
     id attrs = ((id (*)(id, SEL, id*, id*, NSUInteger))objc_msgSend)(
         (id)dict_cls, sel_registerName("dictionaryWithObjects:forKeys:count:"),
         objects, keys, 2);
+    if (!attrs) return;
 
     ((void (*)(id, SEL, CGPoint, id))objc_msgSend)(
         s, sel_registerName("drawAtPoint:withAttributes:"), pt, attrs);
 }
 
 static CGSize text_size(const char *text, id font) {
-    if (!text || text[0] == '\0' || !font) return (CGSize){0, 0};
+    if (!text || text[0] == '\0') return (CGSize){0, 0};
+    if (!font) font = g_font_small;
+    if (!font) return (CGSize){0, 0};
+
     id s = nsstr(text);
     if (!s) return (CGSize){0, 0};
 
+    ensure_text_attrs();
+    if (!s_font_attr_key) return (CGSize){0, 0};
+
     Class dict_cls = objc_getClass("NSDictionary");
-    id font_key = nsstr("NSFont");
+    if (!dict_cls) return (CGSize){0, 0};
+
     id objects[1] = { font };
-    id keys[1] = { font_key };
+    id keys[1] = { s_font_attr_key };
     id attrs = ((id (*)(id, SEL, id*, id*, NSUInteger))objc_msgSend)(
         (id)dict_cls, sel_registerName("dictionaryWithObjects:forKeys:count:"),
         objects, keys, 1);
+    if (!attrs) return (CGSize){0, 0};
 
     return ((CGSize (*)(id, SEL, id))objc_msgSend)(
         s, sel_registerName("sizeWithAttributes:"), attrs);
@@ -731,13 +1071,22 @@ static void esp_drawRect(id self, SEL cmd, CGRect rect) {
     if (!g_snapshot.header.camera_valid || g_snapshot.header.status != 2) return;
     if (monotonic_seconds() - g_changed_at > 2.0) return;
 
+    void *pool = NULL;
+    if (fn_objc_autoreleasePoolPush) pool = fn_objc_autoreleasePoolPush();
+
     CGContextRef ctx = UIGraphicsGetCurrentContext();
-    if (!ctx) return;
+    if (!ctx) {
+        if (fn_objc_autoreleasePoolPop && pool) fn_objc_autoreleasePoolPop(pool);
+        return;
+    }
 
     CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(self, sel_registerName("bounds"));
     double w = bounds.size.width;
     double h = bounds.size.height;
-    if (w <= 10.0 || h <= 10.0) return;
+    if (w <= 10.0 || h <= 10.0) {
+        if (fn_objc_autoreleasePoolPop && pool) fn_objc_autoreleasePoolPop(pool);
+        return;
+    }
 
     /* 1. Render Players */
     uint32_t pcount = g_snapshot.header.player_count;
@@ -883,6 +1232,102 @@ static void esp_drawRect(id self, SEL cmd, CGRect rect) {
             snprintf(dist_buf, sizeof(dist_buf), "%.0fm", p->distance);
             draw_text_centered(dist_buf, (CGPoint){ (head_2d.x + feet_2d.x) / 2.0, feet_2d.y + 8 },
                                g_font_small, g_color_white);
+        }
+
+        /* Feature 8: Threat Ranking Tag */
+        if (g_feat_threat_tier && !is_teammate) {
+            char threat_buf[32];
+            id threat_col = g_color_red;
+            if (p->is_bot) {
+                snprintf(threat_buf, sizeof(threat_buf), "[BOT - LOW]");
+                threat_col = g_color_gold;
+            } else if (p->distance < 85.0f) {
+                snprintf(threat_buf, sizeof(threat_buf), "[TIER 1 DANGER]");
+                threat_col = g_color_red;
+            } else {
+                snprintf(threat_buf, sizeof(threat_buf), "[TIER 2 ENEMY]");
+                threat_col = g_color_orange;
+            }
+            draw_text_centered(threat_buf, (CGPoint){ (head_2d.x + feet_2d.x) / 2.0, box_y - 22 }, g_font_small, threat_col);
+        }
+
+        /* Feature 12: Knocked Bleedout Timer */
+        if (g_feat_knocked_timer && is_knocked) {
+            float bleed_pct = (p->health_max > 0) ? (p->health / p->health_max * 100.0f) : 50.0f;
+            char bleed_buf[32];
+            snprintf(bleed_buf, sizeof(bleed_buf), "+ BLEED: %.0f%% +", bleed_pct);
+            draw_text_centered(bleed_buf, (CGPoint){ (head_2d.x + feet_2d.x) / 2.0, feet_2d.y + 20 }, g_font_small, g_color_orange);
+        }
+
+        /* Feature 4: Enemy Gaze / Line-of-Sight Tracer */
+        if (g_feat_gaze_ray && !is_teammate) {
+            float rad = p->yaw * (float)M_PI / 180.0f;
+            rvec3_t gaze_end = {
+                p->head_pos.x + cosf(rad) * 450.0f,
+                p->head_pos.y + sinf(rad) * 450.0f,
+                p->head_pos.z
+            };
+            CGPoint ray_screen;
+            if (world_to_screen(gaze_end, &ray_screen, NULL, w, h)) {
+                float to_cam_x = g_snapshot.header.camera_pos.x - p->head_pos.x;
+                float to_cam_y = g_snapshot.header.camera_pos.y - p->head_pos.y;
+                float cdist = hypotf(to_cam_x, to_cam_y);
+                float dot = (cosf(rad) * to_cam_x + sinf(rad) * to_cam_y) / (cdist > 0 ? cdist : 1.0f);
+                BOOL targeting_us = (dot > 0.85f);
+
+                if (targeting_us) {
+                    CGContextSetRGBStrokeColor(ctx, 1.0, 0.15, 0.15, 0.95);
+                    CGContextSetLineWidth(ctx, 2.0);
+                    draw_text_centered("[! TARGETING YOU !]", (CGPoint){ ray_screen.x, ray_screen.y - 10.0 }, g_font_small, g_color_red);
+                } else {
+                    CGContextSetRGBStrokeColor(ctx, 1.0, 0.82, 0.1, 0.65);
+                    CGContextSetLineWidth(ctx, 1.2);
+                }
+                CGContextMoveToPoint(ctx, head_2d.x, head_2d.y);
+                CGContextAddLineToPoint(ctx, ray_screen.x, ray_screen.y);
+                CGContextStrokePath(ctx);
+            }
+        }
+
+        /* Feature 1: Target Lead Prediction Dot */
+        if (g_feat_lead_pred && !is_teammate) {
+            float vx = g_tracked_players[i].vel.x;
+            float vy = g_tracked_players[i].vel.y;
+            float vz = g_tracked_players[i].vel.z;
+            float spd = hypotf(vx, vy);
+            if (spd > 25.0f && p->distance > 6.0f) {
+                float bullet_t = p->distance / 880.0f;
+                rvec3_t lead_pos = {
+                    p->head_pos.x + vx * bullet_t,
+                    p->head_pos.y + vy * bullet_t,
+                    p->head_pos.z + vz * bullet_t
+                };
+                CGPoint lead_screen;
+                if (world_to_screen(lead_pos, &lead_screen, NULL, w, h)) {
+                    CGContextSetRGBStrokeColor(ctx, 0.0, 1.0, 0.85, 0.95);
+                    CGContextSetRGBFillColor(ctx, 0.0, 1.0, 0.85, 0.45);
+                    CGContextSetLineWidth(ctx, 1.5);
+                    CGContextStrokeEllipseInRect(ctx, CGRectMake_f(lead_screen.x - 5.0, lead_screen.y - 5.0, 10.0, 10.0));
+                    CGContextFillEllipseInRect(ctx, CGRectMake_f(lead_screen.x - 2.0, lead_screen.y - 2.0, 4.0, 4.0));
+                    draw_text_centered("[LEAD]", (CGPoint){ lead_screen.x, lead_screen.y - 12.0 }, g_font_small, g_color_cyan);
+                }
+            }
+        }
+
+        /* Feature 2: Sniper Bullet Drop Distance Guide */
+        if (g_feat_bullet_drop && !is_teammate && p->distance > 80.0f) {
+            float bullet_t = p->distance / 800.0f;
+            float drop_cm = 0.5f * 980.0f * bullet_t * bullet_t;
+            rvec3_t drop_pos = { p->head_pos.x, p->head_pos.y, p->head_pos.z - drop_cm };
+            CGPoint drop_screen;
+            if (world_to_screen(drop_pos, &drop_screen, NULL, w, h)) {
+                CGContextSetRGBStrokeColor(ctx, 1.0, 0.82, 0.1, 0.85);
+                CGContextSetLineWidth(ctx, 1.2);
+                CGContextMoveToPoint(ctx, head_2d.x - 6.0, drop_screen.y);
+                CGContextAddLineToPoint(ctx, head_2d.x + 6.0, drop_screen.y);
+                CGContextStrokePath(ctx);
+                draw_text_centered("v DROP", (CGPoint){ head_2d.x + 16.0, drop_screen.y }, g_font_small, g_color_gold);
+            }
         }
 
         /* Target Lock Reticle */
@@ -1161,6 +1606,120 @@ static void esp_drawRect(id self, SEL cmd, CGRect rect) {
             draw_text_centered(alert_buf, (CGPoint){ w / 2.0, 39.0 }, g_font_bold, g_color_gold);
         }
     }
+
+    /* Feature 5: Behind-Back Blindspot Danger Warning */
+    if (g_feat_blindspot_alert) {
+        float cam_yaw_rad = -g_snapshot.header.local_rot.y * (float)M_PI / 180.0f;
+        float fwd_x = cosf(cam_yaw_rad), fwd_y = sinf(cam_yaw_rad);
+        float right_x = sinf(cam_yaw_rad), right_y = -cosf(cam_yaw_rad);
+        rvec3_t cam = g_snapshot.header.camera_pos;
+
+        for (uint32_t i = 0; i < pcount; i++) {
+            const radar_player_t *p = &g_snapshot.players[i];
+            if (p->health_status == 2) continue;
+            if (my_team != 0 && p->team_id == my_team) continue;
+            if (p->distance > 65.0f) continue;
+
+            float dx = p->pos.x - cam.x;
+            float dy = p->pos.y - cam.y;
+            float d_horiz = hypotf(dx, dy);
+            if (d_horiz < 1.0f) continue;
+
+            float dot_fwd = (dx * fwd_x + dy * fwd_y) / d_horiz;
+            float dot_right = (dx * right_x + dy * right_y) / d_horiz;
+
+            if (dot_fwd < 0.25f) { /* Flank or Behind */
+                if (dot_right < -0.35f) {
+                    CGContextSetRGBFillColor(ctx, 1.0, 0.2, 0.2, 0.65);
+                    CGContextFillRect(ctx, CGRectMake_f(0, h * 0.35, 8.0, h * 0.30));
+                    draw_text_centered("<< FLANK", (CGPoint){ 35.0, h * 0.50 }, g_font_bold, g_color_red);
+                } else if (dot_right > 0.35f) {
+                    CGContextSetRGBFillColor(ctx, 1.0, 0.2, 0.2, 0.65);
+                    CGContextFillRect(ctx, CGRectMake_f(w - 8.0, h * 0.35, 8.0, h * 0.30));
+                    draw_text_centered("FLANK >>", (CGPoint){ w - 35.0, h * 0.50 }, g_font_bold, g_color_red);
+                } else if (dot_fwd < -0.30f) {
+                    CGContextSetRGBFillColor(ctx, 1.0, 0.1, 0.1, 0.70);
+                    CGContextFillRect(ctx, CGRectMake_f(w * 0.30, h - 8.0, w * 0.40, 8.0));
+                    draw_text_centered("! BEHIND !", (CGPoint){ w * 0.50, h - 22.0 }, g_font_bold, g_color_red);
+                }
+            }
+        }
+    }
+
+    /* Feature 11: Sound / Footstep Radar Visualizer */
+    if (g_feat_sound_radar) {
+        float cam_yaw_rad = -g_snapshot.header.local_rot.y * (float)M_PI / 180.0f;
+        rvec3_t cam = g_snapshot.header.camera_pos;
+        for (uint32_t i = 0; i < pcount; i++) {
+            const radar_player_t *p = &g_snapshot.players[i];
+            if (p->health_status == 2) continue;
+            if (my_team != 0 && p->team_id == my_team) continue;
+            if (p->distance > 42.0f) continue;
+
+            float dx = p->pos.x - cam.x;
+            float dy = p->pos.y - cam.y;
+            float ang = atan2f(dy, dx) - cam_yaw_rad;
+            float cx = w / 2.0f, cy = h / 2.0f;
+            float wave_r = 45.0f + (p->distance / 42.0f) * 35.0f;
+
+            CGContextSetRGBStrokeColor(ctx, 1.0, 0.55, 0.0, 0.75);
+            CGContextSetLineWidth(ctx, 2.0);
+            CGContextAddArc(ctx, cx, cy, wave_r, ang - 0.25f, ang + 0.25f, 0);
+            CGContextStrokePath(ctx);
+        }
+    }
+
+    /* Feature 9: Grenade Warning & Feature 10: Airdrop Beacon */
+    if (g_feat_grenade_warn || g_feat_airdrop_beacon) {
+        uint32_t icount = g_snapshot.header.item_count;
+        if (icount > RADAR_MAX_ITEMS) icount = RADAR_MAX_ITEMS;
+        for (uint32_t i = 0; i < icount; i++) {
+            const radar_item_t *it = &g_snapshot.items[i];
+            BOOL is_nade = (strstr(it->name, "Grenade") || strstr(it->name, "Frag") || strstr(it->name, "Smoke") || strstr(it->name, "Molotov") || strstr(it->name, "Bomb"));
+            BOOL is_drop = (strstr(it->name, "AirDrop") || strstr(it->name, "Drop") || strstr(it->name, "Crate") || strstr(it->name, "Flare") || it->category == 5);
+
+            CGPoint item_screen;
+            if (!world_to_screen(it->pos, &item_screen, NULL, w, h)) continue;
+
+            if (g_feat_grenade_warn && is_nade) {
+                CGContextSetRGBStrokeColor(ctx, 1.0, 0.2, 0.1, 0.90);
+                CGContextSetRGBFillColor(ctx, 1.0, 0.2, 0.1, 0.35);
+                CGContextSetLineWidth(ctx, 2.0);
+                CGContextStrokeEllipseInRect(ctx, CGRectMake_f(item_screen.x - 18.0, item_screen.y - 18.0, 36.0, 36.0));
+                CGContextFillEllipseInRect(ctx, CGRectMake_f(item_screen.x - 6.0, item_screen.y - 6.0, 12.0, 12.0));
+                char nade_txt[48];
+                snprintf(nade_txt, sizeof(nade_txt), "! %s %.0fm !", it->name, it->distance);
+                draw_text_centered(nade_txt, (CGPoint){ item_screen.x, item_screen.y - 24.0 }, g_font_bold, g_color_red);
+            }
+
+            if (g_feat_airdrop_beacon && is_drop) {
+                CGContextSetRGBStrokeColor(ctx, 0.0, 0.95, 1.0, 0.80);
+                CGContextSetLineWidth(ctx, 2.5);
+                CGContextMoveToPoint(ctx, item_screen.x, 0.0);
+                CGContextAddLineToPoint(ctx, item_screen.x, item_screen.y);
+                CGContextStrokePath(ctx);
+
+                char drop_txt[48];
+                snprintf(drop_txt, sizeof(drop_txt), "[AIRDROP %.0fm]", it->distance);
+                draw_text_centered(drop_txt, (CGPoint){ item_screen.x, item_screen.y + 12.0 }, g_font_bold, g_color_cyan);
+            }
+        }
+    }
+
+    /* Feature 6: Spectator Count HUD Badge */
+    if (g_feat_spectator_warn) {
+        draw_text_centered("[SURVEILLANCE: CLEAR]", (CGPoint){ w / 2.0, 16.0 }, g_font_small, g_color_cyan);
+    }
+
+    /* Feature 13: Low HP Tactical Emergency Alert */
+    if (g_feat_auto_evade && closest_enemy_dist < 22.0f) {
+        CGContextSetRGBStrokeColor(ctx, 1.0, 0.15, 0.15, 0.55);
+        CGContextSetLineWidth(ctx, 3.0);
+        CGContextStrokeRect(ctx, CGRectMake_f(2.0, 2.0, w - 4.0, h - 4.0));
+        draw_text_centered("<! CLOSE THREAT - DANGER ZONE !>", (CGPoint){ w / 2.0, h - 35.0 }, g_font_bold, g_color_red);
+    }
+
+    if (fn_objc_autoreleasePoolPop && pool) fn_objc_autoreleasePoolPop(pool);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1171,8 +1730,14 @@ static void radar_drawRect(id self, SEL cmd, CGRect rect) {
     (void)self; (void)cmd; (void)rect;
     if (!g_feat_radar) return;
 
+    void *pool = NULL;
+    if (fn_objc_autoreleasePoolPush) pool = fn_objc_autoreleasePoolPush();
+
     CGContextRef ctx = UIGraphicsGetCurrentContext();
-    if (!ctx) return;
+    if (!ctx) {
+        if (fn_objc_autoreleasePoolPop && pool) fn_objc_autoreleasePoolPop(pool);
+        return;
+    }
 
     float radius = RADAR_VIEW_SIZE / 2.0f;
     float cx = radius, cy = radius;
@@ -1327,6 +1892,8 @@ static void radar_drawRect(id self, SEL cmd, CGRect rect) {
             CGContextStrokePath(ctx);
         }
     }
+
+    if (fn_objc_autoreleasePoolPop && pool) fn_objc_autoreleasePoolPop(pool);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1367,20 +1934,21 @@ static id window_hitTest(id self, SEL cmd, CGPoint point, id event) {
  * is noninteractive, including when the menu is expanded. */
 static void layout_controls(void) {
     if (!g_button_window || !g_menu_window || !g_menu_view) return;
-    double margin = 32.0;
-    g_button_rect.origin.x = fmax(margin, fmin(g_button_rect.origin.x, g_screen_w - 48.0 - margin));
-    g_button_rect.origin.y = fmax(margin, fmin(g_button_rect.origin.y, g_screen_h - 48.0 - margin));
+    double edge = 6.0;
+    g_button_rect.origin.x = fmax(edge, fmin(g_button_rect.origin.x, g_screen_w - 48.0 - edge));
+    g_button_rect.origin.y = fmax(edge, fmin(g_button_rect.origin.y, g_screen_h - 48.0 - edge));
     ((void (*)(id, SEL, CGRect))objc_msgSend)(g_button_window, sel_registerName("setFrame:"), g_button_rect);
     ((void (*)(id, SEL, CGRect))objc_msgSend)(g_drag_button, sel_registerName("setFrame:"), CGRectMake_f(0, 0, 48, 48));
 
     if (g_aim_window && g_aim_button) {
-        g_aim_rect.origin.x = fmax(8.0, fmin(g_aim_rect.origin.x, g_screen_w - 56.0 - 8.0));
-        g_aim_rect.origin.y = fmax(8.0, fmin(g_aim_rect.origin.y, g_screen_h - 56.0 - 8.0));
+        g_aim_rect.origin.x = fmax(edge, fmin(g_aim_rect.origin.x, g_screen_w - 56.0 - edge));
+        g_aim_rect.origin.y = fmax(edge, fmin(g_aim_rect.origin.y, g_screen_h - 56.0 - edge));
         ((void (*)(id, SEL, CGRect))objc_msgSend)(g_aim_window, sel_registerName("setFrame:"), g_aim_rect);
         ((void (*)(id, SEL, CGRect))objc_msgSend)(g_aim_button, sel_registerName("setFrame:"), CGRectMake_f(0, 0, 56, 56));
         hidden(g_aim_window, !g_feat_touch_aim || g_menu_open);
     }
 
+    double margin = 32.0;
     double scale = fmin(1.0, fmin((g_screen_w - 2 * margin) / MENU_WIDTH, (g_screen_h - 2 * margin) / MENU_HEIGHT));
     g_menu_rect = CGRectMake_f((g_screen_w - MENU_WIDTH * scale)/2, (g_screen_h - MENU_HEIGHT * scale)/2, MENU_WIDTH * scale, MENU_HEIGHT * scale);
     ((void (*)(id, SEL, CGRect))objc_msgSend)(g_menu_window, sel_registerName("setFrame:"), g_menu_rect);
@@ -1410,7 +1978,7 @@ static void btn_touchesBegan(id self, SEL cmd, id touches, id event) {
 }
 
 static void btn_touchesMoved(id self, SEL cmd, id touches, id event) {
-    (void)cmd; (void)event;
+    (void)self; (void)cmd; (void)event;
     id touch = ((id (*)(id, SEL))objc_msgSend)(touches, sel_registerName("anyObject"));
     if (touch) {
         CGPoint cur = ((CGPoint (*)(id, SEL, id))objc_msgSend)(
@@ -1420,7 +1988,7 @@ static void btn_touchesMoved(id self, SEL cmd, id touches, id event) {
         if (fabs(dx) > 4.0 || fabs(dy) > 4.0) {
             g_is_dragging = YES;
             CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("bounds"));
-            CGRect f = ((CGRect (*)(id, SEL))objc_msgSend)(self, sel_registerName("frame"));
+            CGRect f = g_button_rect;
             double new_x = g_drag_start_origin.x + dx;
             double new_y = g_drag_start_origin.y + dy;
             if (new_x < 4.0) new_x = 4.0;
@@ -1429,7 +1997,6 @@ static void btn_touchesMoved(id self, SEL cmd, id touches, id event) {
             if (new_y + f.size.height > bounds.size.height - 4.0) new_y = bounds.size.height - f.size.height - 4.0;
             f.origin.x = new_x;
             f.origin.y = new_y;
-            ((void (*)(id, SEL, CGRect))objc_msgSend)(self, sel_registerName("setFrame:"), f);
             g_button_rect = f;
             layout_controls();
         }
@@ -1455,6 +2022,7 @@ static void btn_touchesCancelled(id self, SEL cmd, id touches, id event) {
 
 static CGPoint g_aim_drag_start_touch;
 static CGPoint g_aim_drag_start_origin;
+static BOOL    g_aim_is_dragging = NO;
 
 static void aim_btn_touchesBegan(id self, SEL cmd, id touches, id event) {
     (void)cmd; (void)event;
@@ -1463,6 +2031,7 @@ static void aim_btn_touchesBegan(id self, SEL cmd, id touches, id event) {
         g_aim_drag_start_touch = ((CGPoint (*)(id, SEL, id))objc_msgSend)(
             touch, sel_registerName("locationInView:"), g_window);
         g_aim_drag_start_origin = g_aim_rect.origin;
+        g_aim_is_dragging = NO;
         g_finger_drag_x = 0.0;
         g_finger_drag_y = 0.0;
         g_aim_active = YES;
@@ -1471,27 +2040,28 @@ static void aim_btn_touchesBegan(id self, SEL cmd, id touches, id event) {
 }
 
 static void aim_btn_touchesMoved(id self, SEL cmd, id touches, id event) {
-    (void)cmd; (void)event;
+    (void)self; (void)cmd; (void)event;
     id touch = ((id (*)(id, SEL))objc_msgSend)(touches, sel_registerName("anyObject"));
     if (touch) {
         CGPoint cur = ((CGPoint (*)(id, SEL, id))objc_msgSend)(
             touch, sel_registerName("locationInView:"), g_window);
-        g_finger_drag_x = cur.x - g_aim_drag_start_touch.x;
-        g_finger_drag_y = cur.y - g_aim_drag_start_touch.y;
+        double dx = cur.x - g_aim_drag_start_touch.x;
+        double dy = cur.y - g_aim_drag_start_touch.y;
+        g_finger_drag_x = dx;
+        g_finger_drag_y = dy;
 
-        /* If user drags far while settings menu is open, allow repositioning */
-        if (g_menu_open && (fabs(g_finger_drag_x) > 30.0 || fabs(g_finger_drag_y) > 30.0)) {
+        if (fabs(dx) > 4.0 || fabs(dy) > 4.0) {
+            g_aim_is_dragging = YES;
             CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("bounds"));
-            CGRect f = ((CGRect (*)(id, SEL))objc_msgSend)(self, sel_registerName("frame"));
-            double new_x = g_aim_drag_start_origin.x + g_finger_drag_x;
-            double new_y = g_aim_drag_start_origin.y + g_finger_drag_y;
+            CGRect f = g_aim_rect;
+            double new_x = g_aim_drag_start_origin.x + dx;
+            double new_y = g_aim_drag_start_origin.y + dy;
             if (new_x < 4.0) new_x = 4.0;
             if (new_y < 4.0) new_y = 4.0;
             if (new_x + f.size.width > bounds.size.width - 4.0) new_x = bounds.size.width - f.size.width - 4.0;
             if (new_y + f.size.height > bounds.size.height - 4.0) new_y = bounds.size.height - f.size.height - 4.0;
             f.origin.x = new_x;
             f.origin.y = new_y;
-            ((void (*)(id, SEL, CGRect))objc_msgSend)(self, sel_registerName("setFrame:"), f);
             g_aim_rect = f;
             layout_controls();
         }
@@ -1509,6 +2079,7 @@ static void aim_btn_touchesEnded(id self, SEL cmd, id touches, id event) {
         hid_touch_event(bx, 0.50, 0);
     }
     g_locked_player_idx = -1;
+    g_aim_is_dragging = NO;
 }
 
 static void aim_btn_touchesCancelled(id self, SEL cmd, id touches, id event) {
@@ -1522,6 +2093,7 @@ static void aim_btn_touchesCancelled(id self, SEL cmd, id touches, id event) {
         hid_touch_event(bx, 0.50, 0);
     }
     g_locked_player_idx = -1;
+    g_aim_is_dragging = NO;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1580,6 +2152,21 @@ static void action_toggle_enemy_alert(id self, SEL cmd, id sender){ (void)self; 
 static void action_toggle_offscreen(id self, SEL cmd, id sender)  { (void)self; (void)cmd; (void)sender; g_feat_offscreen_arrows = !g_feat_offscreen_arrows; update_menu_buttons(); }
 static void action_toggle_crosshair(id self, SEL cmd, id sender)  { (void)self; (void)cmd; (void)sender; g_feat_crosshair = !g_feat_crosshair; update_menu_buttons(); }
 static void action_toggle_target_lock(id self, SEL cmd, id sender){ (void)self; (void)cmd; (void)sender; g_feat_target_lock = !g_feat_target_lock; update_menu_buttons(); }
+/* 14 New Action Callbacks */
+static void action_toggle_lead_pred(id self, SEL cmd, id sender)       { (void)self; (void)cmd; (void)sender; g_feat_lead_pred = !g_feat_lead_pred; update_menu_buttons(); }
+static void action_toggle_bullet_drop(id self, SEL cmd, id sender)     { (void)self; (void)cmd; (void)sender; g_feat_bullet_drop = !g_feat_bullet_drop; update_menu_buttons(); }
+static void action_toggle_recoil_comp(id self, SEL cmd, id sender)     { (void)self; (void)cmd; (void)sender; g_feat_recoil_comp = !g_feat_recoil_comp; update_menu_buttons(); }
+static void action_toggle_gaze_ray(id self, SEL cmd, id sender)        { (void)self; (void)cmd; (void)sender; g_feat_gaze_ray = !g_feat_gaze_ray; update_menu_buttons(); }
+static void action_toggle_blindspot_alert(id self, SEL cmd, id sender) { (void)self; (void)cmd; (void)sender; g_feat_blindspot_alert = !g_feat_blindspot_alert; update_menu_buttons(); }
+static void action_toggle_spectator_warn(id self, SEL cmd, id sender)  { (void)self; (void)cmd; (void)sender; g_feat_spectator_warn = !g_feat_spectator_warn; update_menu_buttons(); }
+static void action_toggle_adaptive_fov(id self, SEL cmd, id sender)    { (void)self; (void)cmd; (void)sender; g_feat_adaptive_fov = !g_feat_adaptive_fov; update_menu_buttons(); }
+static void action_toggle_threat_tier(id self, SEL cmd, id sender)     { (void)self; (void)cmd; (void)sender; g_feat_threat_tier = !g_feat_threat_tier; update_menu_buttons(); }
+static void action_toggle_grenade_warn(id self, SEL cmd, id sender)    { (void)self; (void)cmd; (void)sender; g_feat_grenade_warn = !g_feat_grenade_warn; update_menu_buttons(); }
+static void action_toggle_airdrop_beacon(id self, SEL cmd, id sender)  { (void)self; (void)cmd; (void)sender; g_feat_airdrop_beacon = !g_feat_airdrop_beacon; update_menu_buttons(); }
+static void action_toggle_sound_radar(id self, SEL cmd, id sender)     { (void)self; (void)cmd; (void)sender; g_feat_sound_radar = !g_feat_sound_radar; update_menu_buttons(); }
+static void action_toggle_knocked_timer(id self, SEL cmd, id sender)   { (void)self; (void)cmd; (void)sender; g_feat_knocked_timer = !g_feat_knocked_timer; update_menu_buttons(); }
+static void action_toggle_auto_evade(id self, SEL cmd, id sender)      { (void)self; (void)cmd; (void)sender; g_feat_auto_evade = !g_feat_auto_evade; update_menu_buttons(); }
+static void action_toggle_aim_smooth(id self, SEL cmd, id sender)      { (void)self; (void)cmd; (void)sender; g_feat_aim_smooth = !g_feat_aim_smooth; update_menu_buttons(); }
 static void action_close_menu(id self, SEL cmd, id sender) {
     (void)self; (void)cmd; (void)sender;
     if (g_menu_open) toggle_menu();
@@ -1610,6 +2197,10 @@ static int g_frame_counter = 0;
 static void timer_tick(id self, SEL cmd, id timer) {
     (void)self; (void)cmd; (void)timer;
     g_frame_counter++;
+
+    if (g_frame_counter % 200 == 1) {
+        ensure_screen_awake_and_unlocked();
+    }
 
     /* 1. Dynamic orientation & screen bounds adaptation */
     id mainScreen = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIScreen"), sel_registerName("mainScreen"));
@@ -1654,7 +2245,15 @@ static void timer_tick(id self, SEL cmd, id timer) {
         /* When live game camera is tracking, PUBG Mobile on iPhone is landscape */
         is_landscape = YES;
     }
-    g_current_orientation = (ori >= 1 && ori <= 4) ? ori : (is_landscape ? 3 : 1);
+    if (is_landscape) {
+        if (ori == 4) g_current_orientation = 4;
+        else g_current_orientation = 3; /* Default LandscapeRight */
+    } else {
+        g_current_orientation = (ori >= 1 && ori <= 4) ? ori : 3;
+    }
+    if (g_frame_counter % 100 == 1) {
+        update_digitizer_sender_id();
+    }
     if (is_landscape) {
         double sw = fmax(cur_bounds.size.width, cur_bounds.size.height);
         double sh = fmin(cur_bounds.size.width, cur_bounds.size.height);
@@ -1685,7 +2284,7 @@ static void timer_tick(id self, SEL cmd, id timer) {
         g_menu_rect = CGRectMake_f(mx, my, MENU_WIDTH, MENU_HEIGHT);
         if (g_menu_view) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_menu_view, sel_registerName("setFrame:"), g_menu_rect);
 
-        /* Clamp floating button within new screen boundaries */
+        /* Clamp floating buttons within new screen boundaries */
         if (g_drag_button) {
             CGRect bf = g_button_rect;
             if (bf.origin.x + bf.size.width > g_screen_w - 4.0) bf.origin.x = g_screen_w - bf.size.width - 4.0;
@@ -1694,6 +2293,15 @@ static void timer_tick(id self, SEL cmd, id timer) {
             if (bf.origin.y < 4.0) bf.origin.y = 4.0;
             ((void (*)(id, SEL, CGRect))objc_msgSend)(g_drag_button, sel_registerName("setFrame:"), bf);
             g_button_rect = bf;
+            layout_controls();
+        }
+        if (g_aim_button) {
+            CGRect af = g_aim_rect;
+            if (af.origin.x + af.size.width > g_screen_w - 4.0) af.origin.x = g_screen_w - af.size.width - 4.0;
+            if (af.origin.y + af.size.height > g_screen_h - 4.0) af.origin.y = g_screen_h - af.size.height - 4.0;
+            if (af.origin.x < 4.0) af.origin.x = 4.0;
+            if (af.origin.y < 4.0) af.origin.y = 4.0;
+            g_aim_rect = af;
             layout_controls();
         }
     }
@@ -1713,7 +2321,7 @@ static void timer_tick(id self, SEL cmd, id timer) {
     /* Aim Assist Touch Steering Engine */
 
     BOOL aim_enabled = (g_feat_touch_aim && g_aim_trigger_mode != 2);
-    BOOL aim_trigger_active = (g_aim_trigger_mode == 0) ? g_aim_active : YES;
+    BOOL aim_trigger_active = (g_aim_trigger_mode == 0) ? (g_aim_active && !g_aim_is_dragging) : YES;
 
     if (aim_enabled && aim_trigger_active && g_snapshot.header.status == 2 && g_snapshot.header.camera_valid) {
         double screen_w = g_screen_w > 0 ? g_screen_w : 812.0;
@@ -1729,6 +2337,20 @@ static void timer_tick(id self, SEL cmd, id timer) {
         uint32_t pcount = g_snapshot.header.player_count;
         if (pcount > RADAR_MAX_PLAYERS) pcount = RADAR_MAX_PLAYERS;
         uint32_t my_team = (g_snapshot.header.local_team > 0) ? g_snapshot.header.local_team : s_overlay_local_team;
+
+        /* Velocity Tracking for Lead Prediction (Feature 1) */
+        double now_sec = monotonic_seconds();
+        for (uint32_t i = 0; i < pcount; i++) {
+            const radar_player_t *p = &g_snapshot.players[i];
+            double dt = now_sec - g_tracked_players[i].last_time;
+            if (dt > 0.02 && dt < 0.5) {
+                g_tracked_players[i].vel.x = (p->pos.x - g_tracked_players[i].pos.x) / (float)dt;
+                g_tracked_players[i].vel.y = (p->pos.y - g_tracked_players[i].pos.y) / (float)dt;
+                g_tracked_players[i].vel.z = (p->pos.z - g_tracked_players[i].pos.z) / (float)dt;
+            }
+            g_tracked_players[i].pos = p->pos;
+            g_tracked_players[i].last_time = now_sec;
+        }
 
         for (uint32_t i = 0; i < pcount; i++) {
             const radar_player_t *p = &g_snapshot.players[i];
@@ -1747,6 +2369,16 @@ static void timer_tick(id self, SEL cmd, id timer) {
                                             (p->head_pos.y + p->feet_pos.y * 2.0f) / 3.0f,
                                             (p->head_pos.z + p->feet_pos.z * 2.0f) / 3.0f };
             }
+            /* Ballistics Lead Target Adjustment (Feature 1) */
+            if (g_feat_lead_pred && !p->is_bot) {
+                float spd = hypotf(g_tracked_players[i].vel.x, g_tracked_players[i].vel.y);
+                if (spd > 25.0f && p->distance > 6.0f) {
+                    float travel_t = p->distance / 880.0f;
+                    target_3d.x += g_tracked_players[i].vel.x * travel_t;
+                    target_3d.y += g_tracked_players[i].vel.y * travel_t;
+                    target_3d.z += g_tracked_players[i].vel.z * travel_t;
+                }
+            }
 
             CGPoint sp;
             double depth = 0;
@@ -1762,27 +2394,23 @@ static void timer_tick(id self, SEL cmd, id timer) {
             }
         }
 
-        /* Fast Target Swapping: release stroke instantly if target changed */
+        /* Target Swapping & Recenter State Machine */
         double base_x = (g_aim_touch_zone == 0) ? 0.22 : ((g_aim_touch_zone == 1) ? 0.72 : 0.50);
         double base_y = 0.50;
         double min_x  = (g_aim_touch_zone == 0) ? 0.06 : ((g_aim_touch_zone == 1) ? 0.55 : 0.35);
-        double max_x  = (g_aim_touch_zone == 0) ? 0.35 : ((g_aim_touch_zone == 1) ? 0.92 : 0.65);
-        double min_y  = 0.18;
-        double max_y  = 0.82;
-        double touch_circle_radius = 0.09;
-        double aspect = screen_h / (screen_w > 0 ? screen_w : 1.0);
+        double max_x  = (g_aim_touch_zone == 0) ? 0.35 : ((g_aim_touch_zone == 1) ? 0.90 : 0.65);
+        double min_y  = 0.22;
+        double max_y  = 0.78;
 
         if (best_idx != g_locked_player_idx) {
             if (g_sim_touch_down) {
-                hid_touch_event(g_sim_norm_x, g_sim_norm_y, 0); /* Instant release previous target */
+                hid_touch_event(g_sim_norm_x, g_sim_norm_y, 0); /* Clean lift on target switch */
             }
             g_locked_player_idx = best_idx;
             g_sim_norm_x = base_x;
             g_sim_norm_y = base_y;
             g_sim_stroke_frames = 0;
-            if (best_idx >= 0) {
-                hid_touch_event(g_sim_norm_x, g_sim_norm_y, 1); /* Instant touch down on new target */
-            }
+            g_sim_recenter_pause = 1; /* 1 frame (50ms) clean pause before touch down */
         }
 
         if (best_idx >= 0) {
@@ -1796,36 +2424,54 @@ static void timer_tick(id self, SEL cmd, id timer) {
                              ((g_aim_velocity == 1) ? 0.50 :
                              ((g_aim_velocity == 2) ? 0.80 : 1.15));
 
-            if (dist > 2.5) {
+            if (g_sim_recenter_pause > 0) {
+                g_sim_recenter_pause--;
+                if (g_sim_recenter_pause == 0) {
+                    /* Pause ended: touch down cleanly at base */
+                    g_sim_norm_x = base_x;
+                    g_sim_norm_y = base_y;
+                    g_sim_stroke_frames = 0;
+                    hid_touch_event(base_x, base_y, 1); /* Touch Down */
+                }
+            } else if (dist > 2.5) {
                 double dir_x = delta_x / dist;
                 double dir_y = delta_y / dist;
 
-                double step_mag = fmin(0.040, fmax(0.008, (dist / screen_w) * 0.50)) * vel_mult;
+                double step_mag = fmin(0.025, fmax(0.004, (dist / screen_w) * 0.35)) * vel_mult;
                 double step_x = dir_x * step_mag;
                 double step_y = dir_y * step_mag;
+
+                /* Weapon Recoil Compensation Touch Pull-Down (Feature 3) */
+                if (g_feat_recoil_comp) {
+                    step_y += 0.0030 * vel_mult;
+                }
+
+                /* Aim Smoothness Micro-Stroking (Feature 14) */
+                if (g_feat_aim_smooth) {
+                    double smooth_factor = sin(((double)(g_sim_stroke_frames % 14) + 1.0) * 3.14159 / 15.0);
+                    step_x *= (0.75 + 0.50 * smooth_factor);
+                    step_y *= (0.75 + 0.50 * smooth_factor);
+                    step_x += ((double)((rand() % 100) - 50)) * 0.000006;
+                    step_y += ((double)((rand() % 100) - 50)) * 0.000006;
+                }
 
                 if (!g_sim_touch_down) {
                     g_sim_norm_x = base_x;
                     g_sim_norm_y = base_y;
                     g_sim_stroke_frames = 0;
-                    hid_touch_event(g_sim_norm_x, g_sim_norm_y, 1); /* Touch Down */
+                    hid_touch_event(base_x, base_y, 1); /* Touch Down */
                 } else {
                     g_sim_stroke_frames++;
                     double next_x = g_sim_norm_x + step_x;
                     double next_y = g_sim_norm_y + step_y;
 
-                    double off_x = next_x - base_x;
-                    double off_y = (next_y - base_y) * aspect;
-                    double cur_r = hypot(off_x, off_y);
-
-                    if (cur_r >= touch_circle_radius || g_sim_stroke_frames >= 14 ||
-                        next_x < min_x || next_x > max_x || next_y < min_y || next_y > max_y) {
-                        /* Continuous Circular Radius Scrolling: Lift, reset to base, re-touch down */
+                    if (g_sim_stroke_frames >= 20 || next_x < min_x || next_x > max_x || next_y < min_y || next_y > max_y) {
+                        /* Continuous Circular Radius Scrolling: Lift finger cleanly, pause 1 tick, re-center */
                         hid_touch_event(g_sim_norm_x, g_sim_norm_y, 0); /* Touch Up */
                         g_sim_norm_x = base_x;
                         g_sim_norm_y = base_y;
                         g_sim_stroke_frames = 0;
-                        hid_touch_event(g_sim_norm_x, g_sim_norm_y, 1); /* Immediate re-touch down */
+                        g_sim_recenter_pause = 1;
                     } else {
                         g_sim_norm_x = next_x;
                         g_sim_norm_y = next_y;
@@ -1833,27 +2479,32 @@ static void timer_tick(id self, SEL cmd, id timer) {
                     }
                 }
             } else {
+                /* Target centered (dist <= 2.5) -> Smooth release */
                 if (g_sim_touch_down) {
-                    hid_touch_event(g_sim_norm_x, g_sim_norm_y, 0); /* Deadzone reached - release smoothly */
+                    hid_touch_event(g_sim_norm_x, g_sim_norm_y, 0); /* Touch Up */
                     g_sim_norm_x = base_x;
                     g_sim_norm_y = base_y;
                     g_sim_stroke_frames = 0;
                 }
             }
         } else {
+            /* No enemy in FOV -> Lift touch */
             if (g_sim_touch_down) {
                 hid_touch_event(base_x, base_y, 0);
                 g_sim_stroke_frames = 0;
             }
             g_locked_player_idx = -1;
+            g_sim_recenter_pause = 0;
         }
     } else {
+        /* Aim disabled or trigger inactive */
         if (g_sim_touch_down) {
             double bx = (g_aim_touch_zone == 0) ? 0.22 : ((g_aim_touch_zone == 1) ? 0.72 : 0.50);
             hid_touch_event(bx, 0.50, 0);
             g_sim_stroke_frames = 0;
         }
         g_locked_player_idx = -1;
+        g_sim_recenter_pause = 0;
     }
 
     /* Redraw active views */
@@ -1975,34 +2626,40 @@ static void init_overlay(void) {
     /* Cache common colors and fonts */
     if (fstep) { fprintf(fstep, "step 2a: fonts\n"); fflush(fstep); }
     if (UIFont_cls) {
-        g_font_small = ((id (*)(id, SEL, double))objc_msgSend)((id)UIFont_cls, sel_registerName("systemFontOfSize:"), 11.0);
-        g_font_bold  = ((id (*)(id, SEL, double))objc_msgSend)((id)UIFont_cls, sel_registerName("boldSystemFontOfSize:"), 12.0);
+        g_font_small = retain_obj(((id (*)(id, SEL, double))objc_msgSend)((id)UIFont_cls, sel_registerName("systemFontOfSize:"), 11.0));
+        g_font_bold  = retain_obj(((id (*)(id, SEL, double))objc_msgSend)((id)UIFont_cls, sel_registerName("boldSystemFontOfSize:"), 12.0));
     }
     if (fstep) { fprintf(fstep, "step 2b: white\n"); fflush(fstep); }
     if (UIColor_cls) {
-        g_color_white = ((id (*)(id, SEL))objc_msgSend)((id)UIColor_cls, sel_registerName("whiteColor"));
+        g_color_white = retain_obj(((id (*)(id, SEL))objc_msgSend)((id)UIColor_cls, sel_registerName("whiteColor")));
         if (fstep) { fprintf(fstep, "step 2c: green\n"); fflush(fstep); }
-        g_color_green = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 0.2, 0.95, 0.35, 1.0);
+        g_color_green = retain_obj(((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 0.2, 0.95, 0.35, 1.0));
         if (fstep) { fprintf(fstep, "step 2d: yellow\n"); fflush(fstep); }
-        g_color_yellow = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.9, 0.2, 1.0);
+        g_color_yellow = retain_obj(((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.9, 0.2, 1.0));
         if (fstep) { fprintf(fstep, "step 2e: cyan\n"); fflush(fstep); }
-        g_color_cyan = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 0.0, 0.88, 1.0, 1.0);
+        g_color_cyan = retain_obj(((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 0.0, 0.88, 1.0, 1.0));
         if (fstep) { fprintf(fstep, "step 2f: orange\n"); fflush(fstep); }
-        g_color_orange = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.55, 0.0, 1.0);
+        g_color_orange = retain_obj(((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.55, 0.0, 1.0));
         if (fstep) { fprintf(fstep, "step 2g: gold\n"); fflush(fstep); }
-        g_color_gold = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.82, 0.1, 1.0);
+        g_color_gold = retain_obj(((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.82, 0.1, 1.0));
         if (fstep) { fprintf(fstep, "step 2h: red\n"); fflush(fstep); }
-        g_color_red = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.2, 0.2, 1.0);
-        g_color_purple = ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
-            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 0.75, 0.40, 1.0, 1.0);
+        g_color_red = retain_obj(((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.2, 0.2, 1.0));
+        g_color_purple = retain_obj(((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+            (id)UIColor_cls, sel_registerName("colorWithRed:green:blue:alpha:"), 0.75, 0.40, 1.0, 1.0));
+    }
+    ensure_text_attrs();
+    if (fstep) {
+        fprintf(fstep, "step 2i: text_attrs font_key=%p color_key=%p\n", (void*)s_font_attr_key, (void*)s_color_attr_key);
+        fflush(fstep);
     }
     if (fstep) { fprintf(fstep, "step 3: custom classes\n"); fflush(fstep); }
+
 
     /* --- Register Custom Classes --- */
 
@@ -2106,6 +2763,21 @@ static void init_overlay(void) {
         class_addMethod(ActionHelper, sel_registerName("toggleOffscreen:"), (IMP)action_toggle_offscreen, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("toggleCrosshair:"), (IMP)action_toggle_crosshair, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("toggleTargetLock:"), (IMP)action_toggle_target_lock, "v@:@");
+        /* 14 New Methods */
+        class_addMethod(ActionHelper, sel_registerName("toggleLeadPred:"), (IMP)action_toggle_lead_pred, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleBulletDrop:"), (IMP)action_toggle_bullet_drop, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleRecoilComp:"), (IMP)action_toggle_recoil_comp, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleGazeRay:"), (IMP)action_toggle_gaze_ray, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleBlindspot:"), (IMP)action_toggle_blindspot_alert, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleSpectator:"), (IMP)action_toggle_spectator_warn, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleAdaptFov:"), (IMP)action_toggle_adaptive_fov, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleThreatTier:"), (IMP)action_toggle_threat_tier, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleNadeWarn:"), (IMP)action_toggle_grenade_warn, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleAirdrop:"), (IMP)action_toggle_airdrop_beacon, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleSoundRadar:"), (IMP)action_toggle_sound_radar, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleKnockedTimer:"), (IMP)action_toggle_knocked_timer, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleAutoEvade:"), (IMP)action_toggle_auto_evade, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleAimSmooth:"), (IMP)action_toggle_aim_smooth, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("closeMenu:"), (IMP)action_close_menu, "v@:@");
         objc_registerClassPair(ActionHelper);
     }
@@ -2275,15 +2947,15 @@ static void init_overlay(void) {
     id close_btn = make_menu_button(menu, helper, CGRectMake_f(MENU_WIDTH - 108.0, 2.0, 98.0, 36.0), "Collapse", sel_registerName("closeMenu:"));
     style_toggle_button(close_btn, NO);
 
-    /* Embed UIScrollView for 24 feature buttons */
+    /* Embed UIScrollView for 38 feature buttons (19 rows) */
     Class UIScrollView_cls = objc_getClass("UIScrollView");
     id scroll_view = ((id (*)(id, SEL, CGRect))objc_msgSend)(
         ((id (*)(id, SEL))objc_msgSend)((id)UIScrollView_cls, sel_registerName("alloc")),
         sel_registerName("initWithFrame:"), CGRectMake_f(0, 36.0, MENU_WIDTH, 245.0));
-    ((void (*)(id, SEL, CGSize))objc_msgSend)(scroll_view, sel_registerName("setContentSize:"), (CGSize){MENU_WIDTH, 12 * 40.0 + 8.0});
+    ((void (*)(id, SEL, CGSize))objc_msgSend)(scroll_view, sel_registerName("setContentSize:"), (CGSize){MENU_WIDTH, 19 * 40.0 + 8.0});
     ((void (*)(id, SEL, id))objc_msgSend)(menu, sel_registerName("addSubview:"), scroll_view);
 
-    /* 2-Column Grid of 24 Feature Buttons */
+    /* 2-Column Grid of 38 Feature Buttons */
     double c0 = 12.0, c1 = 176.0, bw = 152.0, bh = 34.0;
     #define ROW_Y(r) ((r) * 40.0 + 4.0)
 
@@ -2313,6 +2985,22 @@ static void init_overlay(void) {
     g_btn_offscreen   = make_menu_button(scroll_view, helper, CGRectMake_f(c1, ROW_Y(10), bw, bh), "Offscreen: ON", sel_registerName("toggleOffscreen:"));
     g_btn_crosshair   = make_menu_button(scroll_view, helper, CGRectMake_f(c0, ROW_Y(11), bw, bh), "Crosshair: ON", sel_registerName("toggleCrosshair:"));
     g_btn_target_lock = make_menu_button(scroll_view, helper, CGRectMake_f(c1, ROW_Y(11), bw, bh), "Lock Box: ON",  sel_registerName("toggleTargetLock:"));
+
+    /* 14 New Creative Feature Buttons */
+    g_btn_lead_pred       = make_menu_button(scroll_view, helper, CGRectMake_f(c0, ROW_Y(12), bw, bh), "Lead Dot: ON",     sel_registerName("toggleLeadPred:"));
+    g_btn_bullet_drop     = make_menu_button(scroll_view, helper, CGRectMake_f(c1, ROW_Y(12), bw, bh), "Drop Guide: ON",   sel_registerName("toggleBulletDrop:"));
+    g_btn_recoil_comp     = make_menu_button(scroll_view, helper, CGRectMake_f(c0, ROW_Y(13), bw, bh), "Recoil Comp: ON", sel_registerName("toggleRecoilComp:"));
+    g_btn_gaze_ray        = make_menu_button(scroll_view, helper, CGRectMake_f(c1, ROW_Y(13), bw, bh), "Gaze Rays: ON",    sel_registerName("toggleGazeRay:"));
+    g_btn_blindspot_alert = make_menu_button(scroll_view, helper, CGRectMake_f(c0, ROW_Y(14), bw, bh), "Blind Alert: ON", sel_registerName("toggleBlindspot:"));
+    g_btn_spectator_warn  = make_menu_button(scroll_view, helper, CGRectMake_f(c1, ROW_Y(14), bw, bh), "Spectator: ON",   sel_registerName("toggleSpectator:"));
+    g_btn_adaptive_fov    = make_menu_button(scroll_view, helper, CGRectMake_f(c0, ROW_Y(15), bw, bh), "Adapt FOV: ON",    sel_registerName("toggleAdaptFov:"));
+    g_btn_threat_tier     = make_menu_button(scroll_view, helper, CGRectMake_f(c1, ROW_Y(15), bw, bh), "Threat Rank: ON", sel_registerName("toggleThreatTier:"));
+    g_btn_grenade_warn    = make_menu_button(scroll_view, helper, CGRectMake_f(c0, ROW_Y(16), bw, bh), "Nade Alert: ON",   sel_registerName("toggleNadeWarn:"));
+    g_btn_airdrop_beacon  = make_menu_button(scroll_view, helper, CGRectMake_f(c1, ROW_Y(16), bw, bh), "Airdrop ESP: ON", sel_registerName("toggleAirdrop:"));
+    g_btn_sound_radar     = make_menu_button(scroll_view, helper, CGRectMake_f(c0, ROW_Y(17), bw, bh), "Audio Radar: ON",  sel_registerName("toggleSoundRadar:"));
+    g_btn_knocked_timer   = make_menu_button(scroll_view, helper, CGRectMake_f(c1, ROW_Y(17), bw, bh), "Bleed Timer: ON", sel_registerName("toggleKnockedTimer:"));
+    g_btn_auto_evade      = make_menu_button(scroll_view, helper, CGRectMake_f(c0, ROW_Y(18), bw, bh), "Evade Alert: ON",  sel_registerName("toggleAutoEvade:"));
+    g_btn_aim_smooth      = make_menu_button(scroll_view, helper, CGRectMake_f(c1, ROW_Y(18), bw, bh), "Aim Smooth: ON",  sel_registerName("toggleAimSmooth:"));
     #undef ROW_Y
 
     /* Footer Telemetry Label */
@@ -2335,16 +3023,27 @@ static void init_overlay(void) {
     ((void (*)(id, SEL, BOOL))objc_msgSend)(window, sel_registerName("setHidden:"), NO);
 
     /* --- Built-in Selftest --- */
+    BOOL orig_radar = g_feat_radar;
+    int  orig_aim_mode = g_aim_trigger_mode;
+    BOOL orig_lead = g_feat_lead_pred;
+
     toggle_menu(); /* Open */
     BOOL test_menu_open = g_menu_open;
 
     ((void (*)(id, SEL, NSUInteger))objc_msgSend)(g_btn_radar, sel_registerName("sendActionsForControlEvents:"), 64);
-    BOOL test_radar_toggle = !g_feat_radar;
-    ((void (*)(id, SEL, NSUInteger))objc_msgSend)(g_btn_radar, sel_registerName("sendActionsForControlEvents:"), 64); /* restore */
+    BOOL test_radar_toggle = (g_feat_radar != orig_radar);
+    g_feat_radar = orig_radar;
 
     ((void (*)(id, SEL, NSUInteger))objc_msgSend)(g_btn_touch_aim, sel_registerName("sendActionsForControlEvents:"), 64);
-    BOOL test_aim_toggle = !g_feat_touch_aim;
-    ((void (*)(id, SEL, NSUInteger))objc_msgSend)(g_btn_touch_aim, sel_registerName("sendActionsForControlEvents:"), 64); /* restore */
+    BOOL test_aim_toggle = (g_aim_trigger_mode != orig_aim_mode);
+    g_aim_trigger_mode = orig_aim_mode;
+    g_feat_touch_aim = (orig_aim_mode != 2);
+
+    ((void (*)(id, SEL, NSUInteger))objc_msgSend)(g_btn_lead_pred, sel_registerName("sendActionsForControlEvents:"), 64);
+    BOOL test_lead_toggle = (g_feat_lead_pred != orig_lead);
+    g_feat_lead_pred = orig_lead;
+
+    update_menu_buttons();
 
     CGPoint close_center = {MENU_WIDTH - 59, 20};
     CGPoint close_in_window = ((CGPoint (*)(id, SEL, CGPoint, id))objc_msgSend)(g_menu_view,
@@ -2361,15 +3060,15 @@ static void init_overlay(void) {
     BOOL test_pass_radar  = !window_pointInside(window, 0, (CGPoint){rx + 50, ry + 50}, nil);
 
     if (g_proof) {
-        fprintf(g_proof, "SELFTEST: menu_open=%d radar_toggle=%d aim_toggle=%d pass_corner=%d pass_radar=%d all_features=24\n",
-                test_menu_open, test_radar_toggle, test_aim_toggle, test_pass_corner, test_pass_radar);
+        fprintf(g_proof, "SELFTEST: menu_open=%d radar_toggle=%d aim_toggle=%d lead_toggle=%d pass_corner=%d pass_radar=%d all_features=38\n",
+                test_menu_open, test_radar_toggle, test_aim_toggle, test_lead_toggle, test_pass_corner, test_pass_radar);
         fflush(g_proof);
     }
 
     if (g_proof) {
         CGRect bf = ((CGRect (*)(id, SEL))objc_msgSend)(g_button_window, sel_registerName("frame"));
         CGRect mf = ((CGRect (*)(id, SEL))objc_msgSend)(g_menu_window, sel_registerName("frame"));
-        fprintf(g_proof, "BUILD server-passthrough-20260913 button=(%.0f,%.0f %.0fx%.0f) menu=(%.0f,%.0f %.0fx%.0f) display_interactive=%d\n", bf.origin.x,bf.origin.y,bf.size.width,bf.size.height,mf.origin.x,mf.origin.y,mf.size.width,mf.size.height,
+        fprintf(g_proof, "BUILD touch-delivery-20260919 button=(%.0f,%.0f %.0fx%.0f) menu=(%.0f,%.0f %.0fx%.0f) display_interactive=%d\n", bf.origin.x,bf.origin.y,bf.size.width,bf.size.height,mf.origin.x,mf.origin.y,mf.size.width,mf.size.height,
             ((BOOL (*)(id, SEL))objc_msgSend)(g_window,sel_registerName("isUserInteractionEnabled")));
         fflush(g_proof);
     }
@@ -2380,6 +3079,10 @@ static void init_overlay(void) {
             ((BOOL (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("_usesWindowServerHitTesting")));
         fflush(g_proof);
     }
+
+    /* Ensure screen is awake and unlocked */
+    ensure_screen_awake_and_unlocked();
+
     /* Open shared memory */
     open_shared_memory();
 
@@ -2391,6 +3094,12 @@ static void init_overlay(void) {
     id runloop = ((id (*)(id, SEL))objc_msgSend)((id)NSRunLoop_cls, sel_registerName("mainRunLoop"));
     id mode = nsstr("kCFRunLoopCommonModes");
     ((void (*)(id, SEL, id, id))objc_msgSend)(runloop, sel_registerName("addTimer:forMode:"), timer, mode);
+    FILE *fpid = fopen("/var/mobile/Downloads/overlay_sb_pid.txt", "w");
+    if (fpid) {
+        fprintf(fpid, "%d\n", (int)getpid());
+        fclose(fpid);
+    }
+
     if (g_proof) {
         fprintf(g_proof, "[Radar] Overlay initialized with full 12-feature menu, separate bounded control windows and fitted Collapse menu\n");
         fflush(g_proof);
@@ -2403,6 +3112,15 @@ static void init_overlay(void) {
 
 static void deferred_init(id self, SEL cmd) {
     (void)cmd;
+    Class NSThread_cls = objc_getClass("NSThread");
+    if (NSThread_cls && !((BOOL (*)(id, SEL))objc_msgSend)((id)NSThread_cls, sel_registerName("isMainThread"))) {
+        if (self) {
+            ((void (*)(id, SEL, SEL, id, BOOL))objc_msgSend)(
+                self, sel_registerName("performSelectorOnMainThread:withObject:waitUntilDone:"),
+                sel_registerName("deferredInit"), nil, NO);
+        }
+        return;
+    }
     if (g_window) return;
     init_overlay();
     if (!g_window && self) {
@@ -2413,8 +3131,14 @@ static void deferred_init(id self, SEL cmd) {
     }
 }
 
+static id g_init_helper = nil;
+static int s_tweak_initialized = 0;
+
 __attribute__((constructor))
 static void tweak_entry(void) {
+    if (s_tweak_initialized) return;
+    s_tweak_initialized = 1;
+
     resolve_cg_symbols();
 
     /* Ensure we only run inside SpringBoard */
@@ -2428,7 +3152,14 @@ static void tweak_entry(void) {
         }
     }
 
+    FILE *fpid = fopen("/var/mobile/Downloads/overlay_sb_pid.txt", "w");
+    if (fpid) {
+        fprintf(fpid, "%d\n", (int)getpid());
+        fclose(fpid);
+    }
+
     Class Helper = objc_allocateClassPair(objc_getClass("NSObject"), "CodexRadarV4Init", 0);
+
     if (!Helper) {
         Helper = objc_getClass("CodexRadarV4Init");
     } else {
@@ -2440,6 +3171,7 @@ static void tweak_entry(void) {
     id helper = ((id (*)(id, SEL))objc_msgSend)(
         ((id (*)(id, SEL))objc_msgSend)((id)Helper, sel_registerName("alloc")),
         sel_registerName("init"));
+    g_init_helper = retain_obj(helper);
 
     Class NSThread_cls = objc_getClass("NSThread");
 

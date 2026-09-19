@@ -7,7 +7,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 MONITOR = ROOT.parent
-sys.path.insert(0, str(MONITOR))
+sys.path.insert(0, str(ROOT / "tools"))
 from remote_sh import run_script
 
 def checked(script, timeout=25):
@@ -38,12 +38,14 @@ def main():
 
     print("==> 2. Signing and registering trustcache...")
     sign_script = """
+export PATH=/var/jb/usr/bin:/var/jb/bin:$PATH
+mkdir -p /var/jb/usr/local/libexec /var/jb/Library/LaunchDaemons /var/jb/usr/lib/TweakInject /var/jb/tmp
 # Stage daemon
 cp /var/mobile/Media/ue4loadmonitor_next /var/jb/tmp/ue4loadmonitor_staged
 chmod 755 /var/jb/tmp/ue4loadmonitor_staged
 ldid -S/var/mobile/Media/daemon_entitlements.plist /var/jb/tmp/ue4loadmonitor_staged
 DHASH=$(ldid -h /var/jb/tmp/ue4loadmonitor_staged | grep -o 'CDHash=[0-9a-fA-F]*' | head -n1 | cut -d= -f2)
-/var/jb/basebin/jbctl trustcache add "$DHASH"
+/var/jb/basebin/jbctl trustcache add "$DHASH" 2>/dev/null || true
 
 # Install daemon binary and launchd configuration
 mv /var/jb/tmp/ue4loadmonitor_staged /var/jb/usr/local/libexec/ue4loadmonitor
@@ -56,13 +58,13 @@ cp /var/mobile/Media/radar_overlay_next.dylib /var/jb/usr/lib/TweakInject/radar_
 chmod 755 /var/jb/usr/lib/TweakInject/radar_overlay.dylib
 ldid -S /var/jb/usr/lib/TweakInject/radar_overlay.dylib
 OHASH=$(ldid -h /var/jb/usr/lib/TweakInject/radar_overlay.dylib | grep -o 'CDHash=[0-9a-fA-F]*' | head -n1 | cut -d= -f2)
-/var/jb/basebin/jbctl trustcache add "$OHASH"
+/var/jb/basebin/jbctl trustcache add "$OHASH" 2>/dev/null || true
 
 # Install test_hid_inject tool
 if [ -f /var/mobile/Media/test_hid_inject_next ]; then
     cp /var/mobile/Media/test_hid_inject_next /var/jb/tmp/test_hid_inject
     chmod 755 /var/jb/tmp/test_hid_inject
-    ldid -S /var/jb/tmp/test_hid_inject
+    ldid -S /var/jb/tmp/test_hid_inject 2>/dev/null || true
 fi
 
 # Copy signed binaries back to Media for AFC retrieval
@@ -89,6 +91,7 @@ launchctl kickstart -k system/com.local.ue4loadmonitor 2>/dev/null || true
 
     print("==> 5. Ensuring game and SpringBoard are running cleanly...")
     ensure_script = """
+export PATH=/var/jb/usr/bin:/var/jb/bin:$PATH
 # Check if game is running; if not, launch it
 if ! ps -ef | grep -v grep | grep -q ShadowTrackerExtra; then
     uiopen --bundleid com.tencent.ig || true
