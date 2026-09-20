@@ -505,10 +505,12 @@ static id retain_obj(id obj) {
 
 static int             g_shm_fd     = -1;
 static radar_shared_t *g_shared     = NULL;
+static ino_t           g_shm_ino    = 0;
 static uint32_t        g_last_tick  = 0;
 static double          g_changed_at = 0;
 static uint32_t        s_overlay_local_team = 0;
 static uint32_t        g_reads = 0;
+static void close_shared_memory(void);
 
 /* View references */
 static id g_button_window = nil, g_menu_window = nil, g_aim_window = nil;
@@ -974,12 +976,31 @@ static void draw_text_centered(const char *text, CGPoint center, id font, id col
 /*  Shared Memory Snapshot Reader                                     */
 /* ------------------------------------------------------------------ */
 
+static void close_shared_memory(void) {
+    if (g_shared) {
+        munmap(g_shared, sizeof(radar_shared_t));
+        g_shared = NULL;
+    }
+    if (g_shm_fd >= 0) {
+        close(g_shm_fd);
+        g_shm_fd = -1;
+    }
+    g_shm_ino = 0;
+}
+
 static BOOL open_shared_memory(void) {
+    struct stat st;
+    if (stat(RADAR_FILE_PATH, &st) != 0 || st.st_size < (off_t)sizeof(radar_shared_t)) {
+        return NO;
+    }
+    if (g_shared && g_shm_ino != 0 && st.st_ino != g_shm_ino) {
+        close_shared_memory();
+    }
     if (g_shared) return YES;
+
     g_shm_fd = open(RADAR_FILE_PATH, O_RDONLY);
     if (g_shm_fd < 0) return NO;
 
-    struct stat st;
     if (fstat(g_shm_fd, &st) != 0 || st.st_size < (off_t)sizeof(radar_shared_t)) {
         close(g_shm_fd);
         g_shm_fd = -1;
@@ -994,13 +1015,16 @@ static BOOL open_shared_memory(void) {
         return NO;
     }
 
-    NSLog(nsstr("[Radar] Shared memory opened (%zu bytes, version %u)"),
-          sizeof(radar_shared_t), RADAR_VERSION);
+    g_shm_ino = st.st_ino;
+    NSLog(nsstr("[Radar] Shared memory opened (ino=%llu, %zu bytes, version %u)"),
+          (unsigned long long)g_shm_ino, sizeof(radar_shared_t), RADAR_VERSION);
     return YES;
 }
 
 static BOOL read_snapshot(void) {
-    if (!g_shared) return NO;
+    if (!g_shared) {
+        if (!open_shared_memory()) return NO;
+    }
     for (int retry = 0; retry < 3; retry++) {
         uint32_t seq = __atomic_load_n(&g_shared->header.sequence, __ATOMIC_ACQUIRE);
         if (seq & 1) continue;
@@ -1010,7 +1034,11 @@ static BOOL read_snapshot(void) {
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
         if (seq != __atomic_load_n(&g_shared->header.sequence, __ATOMIC_ACQUIRE)) continue;
-        if (candidate.header.magic != RADAR_MAGIC || candidate.header.version != RADAR_VERSION) return NO;
+        if (candidate.header.magic != RADAR_MAGIC || candidate.header.version != RADAR_VERSION) {
+            close_shared_memory();
+            open_shared_memory();
+            return NO;
+        }
         if (candidate.header.player_count > RADAR_MAX_PLAYERS) return NO;
 
         g_snapshot = candidate;
@@ -1025,6 +1053,18 @@ static BOOL read_snapshot(void) {
 /* ------------------------------------------------------------------ */
 
 static BOOL world_to_screen(rvec3_t world_pos, CGPoint *out_screen, double *out_depth, double w, double h) {
+    if (w <= 10.0 || h <= 10.0) {
+        w = g_screen_w > 0 ? g_screen_w : 812.0;
+        h = g_screen_h > 0 ? g_screen_h : 375.0;
+    }
+    BOOL is_landscape = (g_current_orientation == 3 || g_current_orientation == 4);
+    if (!is_landscape && g_snapshot.header.status == 2 && g_snapshot.header.camera_valid) {
+        is_landscape = YES;
+    }
+    if (is_landscape && w < h) {
+        double tmp = w; w = h; h = tmp;
+    }
+
     rvec3_t cam = g_snapshot.header.camera_pos;
     rvec3_t rot = g_snapshot.header.local_rot;
     double pitch = rot.x * M_PI / 180.0;
@@ -1084,6 +1124,19 @@ static void esp_drawRect(id self, SEL cmd, CGRect rect) {
     CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(self, sel_registerName("bounds"));
     double w = bounds.size.width;
     double h = bounds.size.height;
+    if (w <= 10.0 || h <= 10.0) {
+        w = g_screen_w > 0 ? g_screen_w : 812.0;
+        h = g_screen_h > 0 ? g_screen_h : 375.0;
+    }
+    BOOL is_landscape = (g_current_orientation == 3 || g_current_orientation == 4);
+    if (!is_landscape && g_snapshot.header.status == 2 && g_snapshot.header.camera_valid) {
+        is_landscape = YES;
+    }
+    if (is_landscape && w < h) {
+        double tmp = w;
+        w = h;
+        h = tmp;
+    }
     if (w <= 10.0 || h <= 10.0) {
         if (fn_objc_autoreleasePoolPop && pool) fn_objc_autoreleasePoolPop(pool);
         return;
@@ -2225,18 +2278,29 @@ static void timer_tick(id self, SEL cmd, id timer) {
     (void)self; (void)cmd; (void)timer;
     g_frame_counter++;
 
+    /* 1. Read shared memory snapshot (auto-reconnecting on inode change/recreation) */
+    if (g_frame_counter % 20 == 1) {
+        struct stat st;
+        if (stat(RADAR_FILE_PATH, &st) == 0 && (st.st_ino != g_shm_ino || !g_shared)) {
+            open_shared_memory();
+        }
+    }
+    if (read_snapshot() && g_snapshot.header.tick != g_last_tick) {
+        g_last_tick = g_snapshot.header.tick;
+        g_changed_at = monotonic_seconds();
+        if (g_snapshot.header.local_team > 0) {
+            s_overlay_local_team = g_snapshot.header.local_team;
+        }
+    }
+
     if (g_frame_counter % 200 == 1) {
         ensure_screen_awake_and_unlocked();
     }
 
-    /* 1. Dynamic orientation & screen bounds adaptation */
-    id mainScreen = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIScreen"), sel_registerName("mainScreen"));
-    CGRect cur_bounds = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, sel_registerName("bounds"));
-
+    /* 2. Window scene management */
     id scene = nil;
     if (g_window) scene = ((id (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("windowScene"));
 
-    /* Periodically ensure window is attached to the foreground active UIWindowScene */
     if (g_window && g_frame_counter % 20 == 1) {
         id app = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
         id scenes = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("connectedScenes"));
@@ -2265,8 +2329,23 @@ static void timer_tick(id self, SEL cmd, id timer) {
             if (g_aim_window) ((void (*)(id, SEL, BOOL))objc_msgSend)(g_aim_window, sel_registerName("setHidden:"), !g_feat_touch_aim);
         }
     }
+
+    /* 3. Orientation Triangulation (Scene -> Device -> Live Telemetry) */
     NSInteger ori = 0;
     if (scene) ori = (NSInteger)((id (*)(id, SEL))objc_msgSend)(scene, sel_registerName("interfaceOrientation"));
+    if (ori == 0) {
+        Class UIDevice_cls = objc_getClass("UIDevice");
+        if (UIDevice_cls) {
+            id dev = ((id (*)(id, SEL))objc_msgSend)((id)UIDevice_cls, sel_registerName("currentDevice"));
+            if (dev) {
+                NSInteger dev_ori = (NSInteger)((id (*)(id, SEL))objc_msgSend)(dev, sel_registerName("orientation"));
+                if (dev_ori == 3) ori = 3;      /* UIDeviceOrientationLandscapeLeft -> UIInterfaceOrientationLandscapeRight */
+                else if (dev_ori == 4) ori = 4; /* UIDeviceOrientationLandscapeRight -> UIInterfaceOrientationLandscapeLeft */
+                else if (dev_ori == 1) ori = 1;
+                else if (dev_ori == 2) ori = 2;
+            }
+        }
+    }
     BOOL is_landscape = (ori == 3 || ori == 4);
     if (!is_landscape && g_snapshot.header.status == 2 && g_snapshot.header.camera_valid) {
         /* When live game camera is tracking, PUBG Mobile on iPhone is landscape */
@@ -2281,23 +2360,28 @@ static void timer_tick(id self, SEL cmd, id timer) {
     if (g_frame_counter % 100 == 1) {
         update_digitizer_sender_id();
     }
-    if (is_landscape) {
-        double sw = fmax(cur_bounds.size.width, cur_bounds.size.height);
-        double sh = fmin(cur_bounds.size.width, cur_bounds.size.height);
-        cur_bounds = CGRectMake_f(0, 0, sw, sh);
-    } else {
-        double sw = fmin(cur_bounds.size.width, cur_bounds.size.height);
-        double sh = fmax(cur_bounds.size.width, cur_bounds.size.height);
-        cur_bounds = CGRectMake_f(0, 0, sw, sh);
-    }
 
-    if (cur_bounds.size.width > 0 && cur_bounds.size.height > 0 &&
-        (fabs(cur_bounds.size.width - g_screen_w) > 1.0 || fabs(cur_bounds.size.height - g_screen_h) > 1.0)) {
-        g_screen_w = cur_bounds.size.width;
-        g_screen_h = cur_bounds.size.height;
+    /* 4. Dynamic Screen Dimensions & Midpoint Refresh */
+    id mainScreen = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIScreen"), sel_registerName("mainScreen"));
+    CGRect cur_bounds = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, sel_registerName("bounds"));
+    double raw_w = cur_bounds.size.width;
+    double raw_h = cur_bounds.size.height;
+    if (raw_w <= 10.0 || raw_h <= 10.0) { raw_w = 375.0; raw_h = 812.0; }
 
-        if (g_window) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_window, sel_registerName("setFrame:"), cur_bounds);
-        if (g_esp_view) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_esp_view, sel_registerName("setFrame:"), cur_bounds);
+    double target_w = is_landscape ? fmax(raw_w, raw_h) : fmin(raw_w, raw_h);
+    double target_h = is_landscape ? fmin(raw_w, raw_h) : fmax(raw_w, raw_h);
+    CGRect target_bounds = CGRectMake_f(0, 0, target_w, target_h);
+
+    static NSInteger s_last_orientation = 0;
+    BOOL bounds_changed = (fabs(target_w - g_screen_w) > 1.0 || fabs(target_h - g_screen_h) > 1.0 || g_current_orientation != s_last_orientation);
+
+    if (bounds_changed || g_frame_counter % 20 == 1) {
+        g_screen_w = target_w;
+        g_screen_h = target_h;
+        s_last_orientation = g_current_orientation;
+
+        if (g_window) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_window, sel_registerName("setFrame:"), target_bounds);
+        if (g_esp_view) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_esp_view, sel_registerName("setFrame:"), target_bounds);
 
         /* Adapt radar position for Landscape vs Portrait */
         double rx = fmax(10.0, g_screen_w - RADAR_VIEW_SIZE - 32.0);
@@ -2305,44 +2389,8 @@ static void timer_tick(id self, SEL cmd, id timer) {
         if (g_radar_view) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_radar_view, sel_registerName("setFrame:"),
                                                                     CGRectMake_f(rx, ry, RADAR_VIEW_SIZE, RADAR_VIEW_SIZE));
 
-        /* Adapt settings menu position (centered on screen) */
-        double mx = fmax(10.0, (g_screen_w - MENU_WIDTH) / 2.0);
-        double my = fmax(10.0, (g_screen_h - MENU_HEIGHT) / 2.0);
-        g_menu_rect = CGRectMake_f(mx, my, MENU_WIDTH, MENU_HEIGHT);
-        if (g_menu_view) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_menu_view, sel_registerName("setFrame:"), g_menu_rect);
-
-        /* Clamp floating buttons within new screen boundaries */
-        if (g_drag_button) {
-            CGRect bf = g_button_rect;
-            if (bf.origin.x + bf.size.width > g_screen_w - 4.0) bf.origin.x = g_screen_w - bf.size.width - 4.0;
-            if (bf.origin.y + bf.size.height > g_screen_h - 4.0) bf.origin.y = g_screen_h - bf.size.height - 4.0;
-            if (bf.origin.x < 4.0) bf.origin.x = 4.0;
-            if (bf.origin.y < 4.0) bf.origin.y = 4.0;
-            ((void (*)(id, SEL, CGRect))objc_msgSend)(g_drag_button, sel_registerName("setFrame:"), bf);
-            g_button_rect = bf;
-            layout_controls();
-        }
-        if (g_aim_button) {
-            CGRect af = g_aim_rect;
-            if (af.origin.x + af.size.width > g_screen_w - 4.0) af.origin.x = g_screen_w - af.size.width - 4.0;
-            if (af.origin.y + af.size.height > g_screen_h - 4.0) af.origin.y = g_screen_h - af.size.height - 4.0;
-            if (af.origin.x < 4.0) af.origin.x = 4.0;
-            if (af.origin.y < 4.0) af.origin.y = 4.0;
-            g_aim_rect = af;
-            layout_controls();
-        }
-    }
-
-    if (!g_shared && g_frame_counter % 20 == 1) {
-        open_shared_memory();
-    }
-
-    if (g_shared && read_snapshot() && g_snapshot.header.tick != g_last_tick) {
-        g_last_tick = g_snapshot.header.tick;
-        g_changed_at = monotonic_seconds();
-        if (g_snapshot.header.local_team > 0) {
-            s_overlay_local_team = g_snapshot.header.local_team;
-        }
+        /* Keep controls laid out and centered */
+        layout_controls();
     }
 
     /* Aim Assist Touch Steering Engine */
@@ -2353,6 +2401,9 @@ static void timer_tick(id self, SEL cmd, id timer) {
     if (aim_enabled && aim_trigger_active && g_snapshot.header.status == 2 && g_snapshot.header.camera_valid) {
         double screen_w = g_screen_w > 0 ? g_screen_w : 812.0;
         double screen_h = g_screen_h > 0 ? g_screen_h : 375.0;
+        if (is_landscape && screen_w < screen_h) {
+            double tmp = screen_w; screen_w = screen_h; screen_h = tmp;
+        }
         double center_x = screen_w / 2.0;
         double center_y = screen_h / 2.0;
 
@@ -2556,10 +2607,10 @@ static void timer_tick(id self, SEL cmd, id timer) {
 
     /* Periodic diagnostic logging */
     if (g_proof && g_frame_counter % 100 == 1) {
-        fprintf(g_proof, "timer=%d reads=%u draws=%u tick=%u status=%u players=%u vehs=%u items=%u menu=%d\n",
+        fprintf(g_proof, "timer=%d reads=%u draws=%u tick=%u status=%u players=%u scr=(%.0f,%.0f) mid=(%.1f,%.1f) ori=%ld menu=%d\n",
                 g_frame_counter, g_reads, g_draws, g_last_tick, g_snapshot.header.status,
-                g_snapshot.header.player_count, g_snapshot.header.vehicle_count,
-                g_snapshot.header.item_count, g_menu_open);
+                g_snapshot.header.player_count, g_screen_w, g_screen_h,
+                g_screen_w / 2.0, g_screen_h / 2.0, (long)g_current_orientation, g_menu_open);
         fflush(g_proof);
     }
 }
@@ -2576,6 +2627,10 @@ static BOOL vc_shouldAutorotate(id self, SEL cmd) {
 static BOOL vc_prefersStatusBarHidden(id self, SEL cmd) {
     (void)self; (void)cmd;
     return YES;
+}
+static NSInteger vc_preferredInterfaceOrientation(id self, SEL cmd) {
+    (void)self; (void)cmd;
+    return 3; /* UIInterfaceOrientationLandscapeRight */
 }
 static void vc_loadView(id self, SEL cmd) {
     (void)cmd;
@@ -2844,6 +2899,7 @@ static void init_overlay(void) {
         class_addMethod(CodexOverlayVC, sel_registerName("supportedInterfaceOrientations"), (IMP)vc_supportedOrientations, "Q@:");
         class_addMethod(CodexOverlayVC, sel_registerName("shouldAutorotate"), (IMP)vc_shouldAutorotate, "B@:");
         class_addMethod(CodexOverlayVC, sel_registerName("prefersStatusBarHidden"), (IMP)vc_prefersStatusBarHidden, "B@:");
+        class_addMethod(CodexOverlayVC, sel_registerName("preferredInterfaceOrientationForPresentation"), (IMP)vc_preferredInterfaceOrientation, "q@:");
         class_addMethod(CodexOverlayVC, sel_registerName("loadView"), (IMP)vc_loadView, "v@:");
         objc_registerClassPair(CodexOverlayVC);
     }
@@ -2881,7 +2937,8 @@ static void init_overlay(void) {
     ((void (*)(id, SEL, id))objc_msgSend)(esp, sel_registerName("setBackgroundColor:"), clearColor);
     ((void (*)(id, SEL, BOOL))objc_msgSend)(esp, sel_registerName("setOpaque:"), NO);
     ((void (*)(id, SEL, BOOL))objc_msgSend)(esp, sel_registerName("setUserInteractionEnabled:"), NO);
-    ((void (*)(id, SEL, id))objc_msgSend)(window, sel_registerName("addSubview:"), esp);
+    ((void (*)(id, SEL, NSUInteger))objc_msgSend)(esp, sel_registerName("setAutoresizingMask:"), 18);
+    ((void (*)(id, SEL, id))objc_msgSend)(root_view, sel_registerName("addSubview:"), esp);
     g_esp_view = esp;
 
     /* --- Subview 2: Radar Minimap View (Top-Right) --- */
@@ -2893,7 +2950,7 @@ static void init_overlay(void) {
     ((void (*)(id, SEL, id))objc_msgSend)(radar, sel_registerName("setBackgroundColor:"), clearColor);
     ((void (*)(id, SEL, BOOL))objc_msgSend)(radar, sel_registerName("setOpaque:"), NO);
     ((void (*)(id, SEL, BOOL))objc_msgSend)(radar, sel_registerName("setUserInteractionEnabled:"), NO);
-    ((void (*)(id, SEL, id))objc_msgSend)(window, sel_registerName("addSubview:"), radar);
+    ((void (*)(id, SEL, id))objc_msgSend)(root_view, sel_registerName("addSubview:"), radar);
     g_radar_view = radar;
 
     /* --- Subview 3: Draggable Floating Button --- */

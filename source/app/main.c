@@ -536,6 +536,22 @@ int main(int argc, char *argv[]) {
     dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_NOW | RTLD_GLOBAL);
     dlopen("/System/Library/PrivateFrameworks/UIKitCore.framework/UIKitCore", RTLD_NOW | RTLD_GLOBAL);
 
+    if (argc > 1) {
+        if (strcmp(argv[1], "--start") == 0) {
+            action_start_radar(NULL, 0, NULL);
+            printf("[RadarManager] Started radar and requested game launch.\n");
+            return 0;
+        } else if (strcmp(argv[1], "--stop") == 0) {
+            action_stop_radar(NULL, 0, NULL);
+            printf("[RadarManager] Stopped radar.\n");
+            return 0;
+        } else if (strcmp(argv[1], "--respring") == 0) {
+            action_respring(NULL, 0, NULL);
+            printf("[RadarManager] Respring triggered.\n");
+            return 0;
+        }
+    }
+
     /* Register View Controller */
     Class UIViewController_cls = objc_getClass("UIViewController");
     Class VC_cls = objc_allocateClassPair(UIViewController_cls, "RadarManagerViewController", 0);
