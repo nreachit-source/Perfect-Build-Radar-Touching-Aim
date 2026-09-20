@@ -36,13 +36,19 @@ def main():
     for name, target in {
         "ue4loadmonitor": "var/jb/usr/local/libexec/ue4loadmonitor",
         "radar_overlay.dylib": "var/jb/usr/lib/TweakInject/radar_overlay.dylib",
+        "RadarManager": "var/jb/Applications/RadarManager.app/RadarManager",
     }.items():
-        blob = (ROOT / "artifacts" / name).read_bytes()
+        app_source = ROOT / "artifacts" / name
+        if not app_source.is_file():
+            app_source = ROOT.parent / "build_codex" / name
+        blob = app_source.read_bytes()
         assert hashlib.sha256(blob).hexdigest() == manifest["sha256"][name]
         data[target] = (blob, 0o755)
     for source, target in {
         "source/daemon/com.local.ue4loadmonitor.plist": "var/jb/Library/LaunchDaemons/com.local.ue4loadmonitor.plist",
         "source/overlay/radar_overlay.plist": "var/jb/usr/lib/TweakInject/radar_overlay.plist",
+        "source/app/Info.plist": "var/jb/Applications/RadarManager.app/Info.plist",
+        "source/app/entitlements.plist": "var/jb/Applications/RadarManager.app/entitlements.plist",
         "artifacts/build.json": "var/jb/usr/local/share/ue4loadmonitor/build.json",
     }.items():
         data[target] = ((ROOT / source).read_bytes(), 0o644)
@@ -50,7 +56,7 @@ def main():
 Name: UE4 Load Monitor
 Version: {version}
 Architecture: iphoneos-arm64
-Description: Live radar with display touch passthrough and on-phone ESP controls.
+Description: Live radar with display touch passthrough, on-phone ESP controls, and on-device Radar Manager app.
 Maintainer: Local Development
 Section: Development
 Depends: firmware (>= 13.0)
@@ -59,11 +65,17 @@ Depends: firmware (>= 13.0)
 set -e
 export PATH=/var/jb/usr/bin:/var/jb/bin:/var/jb/basebin:/usr/bin:/bin:/usr/sbin:/sbin
 # Release artifacts are already signed. Preserve their exact hashes.
-for file in /var/jb/usr/local/libexec/ue4loadmonitor /var/jb/usr/lib/TweakInject/radar_overlay.dylib; do
- hash=$(ldid -h "$file" | sed -n 's/^CDHash=//p')
- test -n "$hash"
- /var/jb/basebin/jbctl trustcache add "$hash"
+for file in /var/jb/usr/local/libexec/ue4loadmonitor /var/jb/usr/lib/TweakInject/radar_overlay.dylib /var/jb/Applications/RadarManager.app/RadarManager; do
+ if [ -f "$file" ]; then
+  hash=$(ldid -h "$file" | sed -n 's/^CDHash=//p')
+  if [ -n "$hash" ]; then
+   /var/jb/basebin/jbctl trustcache add "$hash" 2>/dev/null || true
+  fi
+ fi
 done
+if [ -x /var/jb/usr/bin/uicache ]; then
+ /var/jb/usr/bin/uicache -p /var/jb/Applications/RadarManager.app 2>/dev/null || true
+fi
 plist=/var/jb/Library/LaunchDaemons/com.local.ue4loadmonitor.plist
 if ! launchctl print system/com.local.ue4loadmonitor >/dev/null 2>&1; then
  launchctl bootstrap system "$plist"
@@ -79,7 +91,12 @@ exit 0
 """
     prerm = b"""#!/var/jb/bin/sh
 export PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin
-case "$1" in remove|deconfigure) launchctl bootout system/com.local.ue4loadmonitor 2>/dev/null || true ;; esac
+case "$1" in remove|deconfigure)
+ launchctl bootout system/com.local.ue4loadmonitor 2>/dev/null || true
+ if [ -x /var/jb/usr/bin/uicache ]; then
+  /var/jb/usr/bin/uicache -u /var/jb/Applications/RadarManager.app 2>/dev/null || true
+ fi
+;; esac
 exit 0
 """
     members = {"debian-binary": b"2.0\n", "control.tar.gz": tar_bytes({"control": (control.encode(), 0o644), "postinst": (postinst, 0o755), "prerm": (prerm, 0o755)}), "data.tar.gz": tar_bytes(data)}

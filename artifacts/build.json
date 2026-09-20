@@ -1,10 +1,11 @@
 {
-  "version": "1.3.4",
-  "build": "touch-delivery-20260919",
+  "version": "1.3.5",
+  "build": "on-device-manager-20260920",
   "sha256": {
-    "ue4loadmonitor": "5c449da9a77aab922bc3f813829c550fa8c4195dc38e998b38f39839b6db2467",
-    "radar_overlay.dylib": "f35069869b5e195d36047f3c95c09bdd6a045f8e4b46ffc8dd2f877ab38b66c2"
+    "ue4loadmonitor": "ce9a9c04ab3aa1c484af9bd8fb67c58bd4bc1ad81c9857764ff364e4e2be4062",
+    "radar_overlay.dylib": "98d011dd3edc0535a74aecf277fa70ba0f626b4522fa599effd46c0cf1c19fb1",
+    "RadarManager": "801987456adac4fd0d6a0b99391f6396aea6aa3b81f6faa0920fa45534232d62"
   },
   "source": "source/overlay/radar_overlay.m",
-  "note": "Signed artifacts match installed device SHA-256. Build and dispatch checks passed; foreground touch delivery awaits gameplay verification."
+  "note": "Signed artifacts match installed device SHA-256. Includes standalone on-device Radar Manager app, in-overlay stop button, and XNU watchdog check-in invariant."
 }

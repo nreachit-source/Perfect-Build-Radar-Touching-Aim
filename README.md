@@ -45,19 +45,31 @@ https://raw.githubusercontent.com/nreachit-source/Perfect-Build-Radar-Touching-A
 
 ## Quick Start Guide
 
-### Option 1: One-Click Windows Launcher (`Start Radar.bat`)
-1. Connect your jailbroken iPhone to your PC via USB.
-2. Unlock the device and ensure Dopamine jailbreak is active with **iDownload** enabled.
-3. Double-click **`Start Radar.bat`** in this folder.
-4. The launcher automatically forwards USB communications, synchronizes binaries, exits safe mode if needed, and launches the monitor daemon.
-5. Launch `ShadowTrackerExtra` on the device. The ESP overlay and draggable buttons will appear automatically.
-
-### Option 2: Standalone On-Device (No PC Required)
+### Option 1: Standalone On-Device App (No PC Required — 100% Mobile)
 1. Add the Sileo repository source:
    `https://raw.githubusercontent.com/nreachit-source/Perfect-Build-Radar-Touching-Aim/main/`
-2. Install the `UE4 Load Monitor` package.
-3. Respring device (`sbreload`).
-4. Launch the game — ElleKit loads `radar_overlay.dylib` directly into SpringBoard, and `launchd` manages `ue4loadmonitor`.
+2. Install or upgrade the `UE4 Load Monitor` package (v1.3.5).
+3. Tap the **Radar Manager** app icon on your iPhone Home Screen.
+4. The dashboard displays real-time telemetry (daemon status, game state, overlay health, IPC memory).
+5. Tap **`▶ START RADAR & GAME`**:
+   - Clears safe mode flags.
+   - Kickstarts `ue4loadmonitor`.
+   - Launches `ShadowTrackerExtra` automatically.
+6. When finished playing:
+   - Tap **`🛑 STOP RADAR (Exit Daemon)`** directly inside the floating in-game overlay menu, OR
+   - Open **Radar Manager** and tap **`⏹ STOP RADAR`**.
+
+### Option 2: Windows PC Launcher (`Start Radar.bat` / `close the radar.bat`)
+1. Connect your jailbroken iPhone to your PC via USB.
+2. Double-click **`Start Radar.bat`** on your desktop to start the daemon and game.
+3. Double-click **`close the radar.bat`** on your desktop to instantly stop the daemon.
+
+---
+
+## Stability & Kernel Safety Invariants
+
+- **Zero Watchdog Panics**: The Apple XNU kernel enforces a hardware watchdog check-in timer every 600 seconds. Unlike legacy tools that disabled or killed `watchdogd` (causing sudden reboots and loss of jailbreak at $t=604$s), v1.3.5 preserves `watchdogd` in a healthy running state to eliminate kernel panics.
+- **Rootless Sandboxing**: Both `ue4loadmonitor` and `RadarManager.app` are signed with rootless entitlements (`platform-application=YES`, `com.apple.private.security.no-sandbox=YES`) and trusted via `jbctl trustcache add`.
 
 ---
 

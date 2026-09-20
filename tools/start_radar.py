@@ -53,13 +53,11 @@ def remote(script, timeout=25):
 
 
 def _watchdog_petter_loop():
-    """Safely neutralizes watchdogd to prevent hardware sensor panics without crash-looping thermalmonitord."""
+    """Ensures thermalmonitord remains active while preserving watchdogd to satisfy XNU kernel 600s check-ins."""
     while not _stop_event.is_set():
         try:
             if connected():
                 remote(
-                    "/var/jb/bin/launchctl disable system/com.apple.watchdogd 2>/dev/null || "
-                    "/var/jb/bin/launchctl stop system/com.apple.watchdogd 2>/dev/null || "
                     "/var/jb/bin/launchctl kickstart system/com.apple.thermalmonitord 2>/dev/null || true",
                     timeout=10
                 )
@@ -254,7 +252,7 @@ def main():
     args = parser.parse_args()
 
     print("================================================================", flush=True)
-    print("      iOS UE4 Radar, Aim Assist & ESP Launcher (v1.3.4)         ", flush=True)
+    print("      iOS UE4 Radar, Aim Assist & ESP Launcher (v1.3.5)         ", flush=True)
     print("================================================================", flush=True)
     print("[*] Keep phone UNLOCKED and screen ON during startup.", flush=True)
     print("[*] Connecting to iPhone over USB (port 1337)...", flush=True)

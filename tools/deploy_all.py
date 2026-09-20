@@ -30,6 +30,12 @@ def main():
                     str(MONITOR / "build_codex/radar_overlay.dylib"), "/radar_overlay_next.dylib"], check=True)
     subprocess.run([str(python), "-m", "pymobiledevice3", "afc", "push",
                     str(ROOT / "source/overlay/radar_overlay.plist"), "/radar_overlay.plist"], check=True)
+    subprocess.run([str(python), "-m", "pymobiledevice3", "afc", "push",
+                    str(MONITOR / "build_codex/RadarManager"), "/RadarManager_next"], check=True)
+    subprocess.run([str(python), "-m", "pymobiledevice3", "afc", "push",
+                    str(ROOT / "source/app/Info.plist"), "/RadarManager_Info.plist"], check=True)
+    subprocess.run([str(python), "-m", "pymobiledevice3", "afc", "push",
+                    str(ROOT / "source/app/entitlements.plist"), "/RadarManager_entitlements.plist"], check=True)
 
     test_hid = MONITOR / "build_codex/test_hid_inject"
     if test_hid.is_file():
@@ -39,7 +45,7 @@ def main():
     print("==> 2. Signing and registering trustcache...")
     sign_script = """
 export PATH=/var/jb/usr/bin:/var/jb/bin:$PATH
-mkdir -p /var/jb/usr/local/libexec /var/jb/Library/LaunchDaemons /var/jb/usr/lib/TweakInject /var/jb/tmp
+mkdir -p /var/jb/usr/local/libexec /var/jb/Library/LaunchDaemons /var/jb/usr/lib/TweakInject /var/jb/Applications/RadarManager.app /var/jb/tmp
 # Stage daemon
 cp /var/mobile/Media/ue4loadmonitor_next /var/jb/tmp/ue4loadmonitor_staged
 chmod 755 /var/jb/tmp/ue4loadmonitor_staged
@@ -60,6 +66,18 @@ ldid -S /var/jb/usr/lib/TweakInject/radar_overlay.dylib
 OHASH=$(ldid -h /var/jb/usr/lib/TweakInject/radar_overlay.dylib | grep -o 'CDHash=[0-9a-fA-F]*' | head -n1 | cut -d= -f2)
 /var/jb/basebin/jbctl trustcache add "$OHASH" 2>/dev/null || true
 
+# Install RadarManager.app
+cp /var/mobile/Media/RadarManager_next /var/jb/Applications/RadarManager.app/RadarManager
+cp /var/mobile/Media/RadarManager_Info.plist /var/jb/Applications/RadarManager.app/Info.plist
+chmod 755 /var/jb/Applications/RadarManager.app/RadarManager
+chmod 644 /var/jb/Applications/RadarManager.app/Info.plist
+ldid -S/var/mobile/Media/RadarManager_entitlements.plist /var/jb/Applications/RadarManager.app/RadarManager
+APPHASH=$(ldid -h /var/jb/Applications/RadarManager.app/RadarManager | grep -o 'CDHash=[0-9a-fA-F]*' | head -n1 | cut -d= -f2)
+/var/jb/basebin/jbctl trustcache add "$APPHASH" 2>/dev/null || true
+if [ -x /var/jb/usr/bin/uicache ]; then
+    /var/jb/usr/bin/uicache -p /var/jb/Applications/RadarManager.app 2>/dev/null || true
+fi
+
 # Install test_hid_inject tool
 if [ -f /var/mobile/Media/test_hid_inject_next ]; then
     cp /var/mobile/Media/test_hid_inject_next /var/jb/tmp/test_hid_inject
@@ -70,6 +88,7 @@ fi
 # Copy signed binaries back to Media for AFC retrieval
 cp /var/jb/usr/local/libexec/ue4loadmonitor /var/mobile/Media/ue4loadmonitor_signed
 cp /var/jb/usr/lib/TweakInject/radar_overlay.dylib /var/mobile/Media/radar_overlay_signed.dylib
+cp /var/jb/Applications/RadarManager.app/RadarManager /var/mobile/Media/RadarManager_signed
 
 # Bootstrap daemon via launchctl
 launchctl unload /var/jb/Library/LaunchDaemons/com.local.ue4loadmonitor.plist 2>/dev/null || true
@@ -77,13 +96,15 @@ launchctl load -w /var/jb/Library/LaunchDaemons/com.local.ue4loadmonitor.plist 2
 launchctl kickstart -k system/com.local.ue4loadmonitor 2>/dev/null || true
 """
     res = checked(sign_script)
-    print("Daemon and tweak staged successfully.")
+    print("Daemon, tweak, and RadarManager app staged successfully.")
 
     print("==> 3. Pulling signed artifacts back to host repository...")
     subprocess.run([str(python), "-m", "pymobiledevice3", "afc", "pull",
                     "/ue4loadmonitor_signed", str(ROOT / "artifacts/ue4loadmonitor")], check=True)
     subprocess.run([str(python), "-m", "pymobiledevice3", "afc", "pull",
                     "/radar_overlay_signed.dylib", str(ROOT / "artifacts/radar_overlay.dylib")], check=True)
+    subprocess.run([str(python), "-m", "pymobiledevice3", "afc", "pull",
+                    "/RadarManager_signed", str(ROOT / "artifacts/RadarManager")], check=True)
 
     print("==> 4. Updating build manifest and packaging signed release...")
     import update_artifacts

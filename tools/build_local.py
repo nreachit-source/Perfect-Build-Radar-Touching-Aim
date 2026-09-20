@@ -47,6 +47,7 @@ def main():
         "ue4loadmonitor": [str(src / (name + ".c")) for name in daemon],
         "radar_overlay.dylib": ["-x", "c", "-dynamiclib", "-Wl,-undefined,dynamic_lookup",
                                 str(ROOT / "source/overlay/radar_overlay.m")],
+        "RadarManager": ["-Wl,-undefined,dynamic_lookup", str(ROOT / "source/app/main.c")],
         "sdk_regression": ["-I", str(src),
             '-DUE4_SDK_OUTPUT_PATH="/var/jb/tmp/codex_sdk_regression.json"',
             '-DUE4_SDK_LOG_PATH="/var/jb/tmp/codex_sdk_regression.log"',
@@ -61,6 +62,15 @@ def main():
         subprocess.run(common + flags + ["-o", str(output)], check=True)
         patch_ios(output)
         print(f"Built and verified iOS ARM64: {output}", flush=True)
+
+    # Stage RadarManager.app bundle
+    app_dir = args.out / "RadarManager.app"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+    shutil.copy2(args.out / "RadarManager", app_dir / "RadarManager")
+    shutil.copy2(ROOT / "source/app/Info.plist", app_dir / "Info.plist")
+    shutil.copy2(ROOT / "source/app/entitlements.plist", app_dir / "entitlements.plist")
+    print(f"Staged application bundle: {app_dir}", flush=True)
 
 
 if __name__ == "__main__":

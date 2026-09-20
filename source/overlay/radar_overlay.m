@@ -676,6 +676,7 @@ static id g_btn_sound_radar     = nil;
 static id g_btn_knocked_timer   = nil;
 static id g_btn_auto_evade      = nil;
 static id g_btn_aim_smooth      = nil;
+static id g_btn_stop_radar      = nil;
 
 /* Typography & Colors cached */
 static id g_font_small  = nil;
@@ -2172,6 +2173,26 @@ static void action_close_menu(id self, SEL cmd, id sender) {
     if (g_menu_open) toggle_menu();
 }
 
+static void action_stop_radar(id self, SEL cmd, id sender) {
+    (void)self; (void)cmd; (void)sender;
+    system("killall -9 ue4loadmonitor 2>/dev/null; /var/jb/bin/launchctl stop user/501/com.local.ue4loadmonitor 2>/dev/null; rm -f /var/mobile/Downloads/ue4_radar.bin 2>/dev/null");
+    if (g_shared) {
+        munmap(g_shared, sizeof(radar_shared_t));
+        g_shared = NULL;
+    }
+    if (g_shm_fd >= 0) {
+        close(g_shm_fd);
+        g_shm_fd = -1;
+    }
+    if (g_esp_view) {
+        ((void (*)(id, SEL))objc_msgSend)(g_esp_view, sel_registerName("setNeedsDisplay"));
+    }
+    if (g_radar_view) {
+        ((void (*)(id, SEL))objc_msgSend)(g_radar_view, sel_registerName("setNeedsDisplay"));
+    }
+    if (g_menu_open) toggle_menu();
+}
+
 static id make_menu_button(id parent, id target, CGRect frame, const char *text, SEL action) {
     id btn = ((id (*)(id, SEL, NSInteger))objc_msgSend)(
         (id)objc_getClass("UIButton"), sel_registerName("buttonWithType:"), 1);
@@ -2779,6 +2800,7 @@ static void init_overlay(void) {
         class_addMethod(ActionHelper, sel_registerName("toggleAutoEvade:"), (IMP)action_toggle_auto_evade, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("toggleAimSmooth:"), (IMP)action_toggle_aim_smooth, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("closeMenu:"), (IMP)action_close_menu, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("stopRadar:"), (IMP)action_stop_radar, "v@:@");
         objc_registerClassPair(ActionHelper);
     }
     Class metaH = object_getClass((id)ActionHelper);
@@ -3001,6 +3023,18 @@ static void init_overlay(void) {
     g_btn_knocked_timer   = make_menu_button(scroll_view, helper, CGRectMake_f(c1, ROW_Y(17), bw, bh), "Bleed Timer: ON", sel_registerName("toggleKnockedTimer:"));
     g_btn_auto_evade      = make_menu_button(scroll_view, helper, CGRectMake_f(c0, ROW_Y(18), bw, bh), "Evade Alert: ON",  sel_registerName("toggleAutoEvade:"));
     g_btn_aim_smooth      = make_menu_button(scroll_view, helper, CGRectMake_f(c1, ROW_Y(18), bw, bh), "Aim Smooth: ON",  sel_registerName("toggleAimSmooth:"));
+
+    /* Stop Radar Control Button */
+    g_btn_stop_radar      = make_menu_button(scroll_view, helper, CGRectMake_f(c0, ROW_Y(19), bw * 2 + 12.0, bh), "🛑 STOP RADAR (Exit Daemon)", sel_registerName("stopRadar:"));
+    id stop_layer = ((id (*)(id, SEL))objc_msgSend)(g_btn_stop_radar, sel_registerName("layer"));
+    if (stop_layer) {
+        id cg_red = ((id (*)(id, SEL))objc_msgSend)(
+            ((id (*)(id, SEL, double, double, double, double))objc_msgSend)(
+                (id)objc_getClass("UIColor"), sel_registerName("colorWithRed:green:blue:alpha:"), 0.85, 0.12, 0.16, 0.90),
+            sel_registerName("CGColor"));
+        ((void (*)(id, SEL, id))objc_msgSend)(stop_layer, sel_registerName("setBackgroundColor:"), cg_red);
+        ((void (*)(id, SEL, double))objc_msgSend)(stop_layer, sel_registerName("setCornerRadius:"), 8.0);
+    }
     #undef ROW_Y
 
     /* Footer Telemetry Label */
