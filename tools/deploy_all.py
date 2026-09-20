@@ -74,6 +74,8 @@ chmod 644 /var/jb/Applications/RadarManager.app/Info.plist
 ldid -S/var/mobile/Media/RadarManager_entitlements.plist /var/jb/Applications/RadarManager.app/RadarManager
 APPHASH=$(ldid -h /var/jb/Applications/RadarManager.app/RadarManager | grep -o 'CDHash=[0-9a-fA-F]*' | head -n1 | cut -d= -f2)
 /var/jb/basebin/jbctl trustcache add "$APPHASH" 2>/dev/null || true
+chown root:wheel /var/jb/Applications/RadarManager.app/RadarManager
+chmod 4755 /var/jb/Applications/RadarManager.app/RadarManager
 if [ -x /var/jb/usr/bin/uicache ]; then
     /var/jb/usr/bin/uicache -p /var/jb/Applications/RadarManager.app 2>/dev/null || true
 fi

@@ -2175,7 +2175,13 @@ static void action_close_menu(id self, SEL cmd, id sender) {
 
 static void action_stop_radar(id self, SEL cmd, id sender) {
     (void)self; (void)cmd; (void)sender;
-    system("killall -9 ue4loadmonitor 2>/dev/null; /var/jb/bin/launchctl stop user/501/com.local.ue4loadmonitor 2>/dev/null; rm -f /var/mobile/Downloads/ue4_radar.bin 2>/dev/null");
+    FILE *fp = fopen("/var/mobile/Downloads/radar_stop.flag", "w");
+    if (fp) {
+        fprintf(fp, "STOP\n");
+        fclose(fp);
+        chown("/var/mobile/Downloads/radar_stop.flag", 501, 501);
+    }
+    system("killall -9 ue4loadmonitor 2>/dev/null; /var/jb/bin/launchctl stop system/com.local.ue4loadmonitor 2>/dev/null; rm -f /var/mobile/Downloads/ue4_radar.bin 2>/dev/null");
     if (g_shared) {
         munmap(g_shared, sizeof(radar_shared_t));
         g_shared = NULL;

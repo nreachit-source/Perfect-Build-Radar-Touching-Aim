@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -21,14 +22,17 @@ static const char kMarkerPath[] =
     "/var/mobile/Downloads/I_have_loaded.txt";
 static const char kMarkerText[] = "I have loaded. I am running.\n";
 
+static const char kStopFlagPath[] = "/var/mobile/Downloads/radar_stop.flag";
+static const char kPidFilePath[] = "/var/mobile/Downloads/ue4loadmonitor.pid";
+
 static volatile sig_atomic_t gRunning = 1;
 static void *g_daemon_txn = NULL;
 
 /* Prevent hardware sensor watchdog timeout panic on devices with missing TG0B battery sensors */
 static void *watchdog_petter(void *arg) {
     (void)arg;
-    /* Safely neutralize watchdogd once at startup to prevent missing-sensor userspace reboots */
-    system("launchctl disable system/com.apple.watchdogd 2>/dev/null; launchctl stop system/com.apple.watchdogd 2>/dev/null; launchctl kickstart system/com.apple.thermalmonitord 2>/dev/null");
+    /* Kickstart thermalmonitord while preserving watchdogd to satisfy XNU kernel 600s check-ins */
+    system("launchctl kickstart system/com.apple.thermalmonitord 2>/dev/null || true");
     while (gRunning) {
         for (int i = 0; i < 60 && gRunning; i++) {
             sleep(1);
@@ -133,6 +137,13 @@ static void run_radar_loop(pid_t target_pid) {
     }
 
     while (gRunning) {
+        /* Check if stop flag was signaled from on-device app or in-game overlay */
+        if (access(kStopFlagPath, F_OK) == 0) {
+            unlink(kStopFlagPath);
+            gRunning = 0;
+            break;
+        }
+
         /* Check if target process is still alive */
         pid_t cur = find_target_process();
         if (cur != target_pid) break;
@@ -152,12 +163,21 @@ int main(int argc, char **argv) {
     hold_daemon_transaction();
     raise_jetsam_limit();
 
+    /* Write daemon PID file */
+    FILE *fpid = fopen(kPidFilePath, "w");
+    if (fpid) {
+        fprintf(fpid, "%d\n", (int)getpid());
+        fclose(fpid);
+        chown(kPidFilePath, 501, 501);
+    }
+
     pthread_t petter_tid;
     pthread_create(&petter_tid, NULL, watchdog_petter, NULL);
     pthread_detach(petter_tid);
 
     if (argc == 3 && strcmp(argv[1], "--dump-once") == 0) {
         pid_t pid = (pid_t)atoi(argv[2]);
+        unlink(kPidFilePath);
         return pid > 0 && ue4_sdk_generate(pid) == 0 ? 0 : 1;
     }
 
@@ -167,12 +187,20 @@ int main(int argc, char **argv) {
             write_marker();
             /* Live mode uses the existing schema/offsets; never dumps. */
             run_radar_loop(direct_pid);
+            unlink(kPidFilePath);
             return 0;
         }
     }
 
     pid_t last_reported_pid = 0;
     while (gRunning != 0) {
+        /* Check if stop flag was signaled from on-device app or in-game overlay */
+        if (access(kStopFlagPath, F_OK) == 0) {
+            unlink(kStopFlagPath);
+            gRunning = 0;
+            break;
+        }
+
         const pid_t pid = find_target_process();
         if (pid != 0 && pid != last_reported_pid) {
             if (write_marker() == 0) {
@@ -186,5 +214,8 @@ int main(int argc, char **argv) {
         }
         usleep(250000); /* Detect launch/recover task acquisition within 250ms. */
     }
+
+    unlink(kPidFilePath);
+    unlink("/var/mobile/Downloads/ue4_radar.bin");
     return 0;
 }

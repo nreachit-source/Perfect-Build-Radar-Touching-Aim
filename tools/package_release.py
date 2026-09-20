@@ -73,6 +73,10 @@ for file in /var/jb/usr/local/libexec/ue4loadmonitor /var/jb/usr/lib/TweakInject
   fi
  fi
 done
+if [ -f /var/jb/Applications/RadarManager.app/RadarManager ]; then
+ chown root:wheel /var/jb/Applications/RadarManager.app/RadarManager
+ chmod 4755 /var/jb/Applications/RadarManager.app/RadarManager
+fi
 if [ -x /var/jb/usr/bin/uicache ]; then
  /var/jb/usr/bin/uicache -p /var/jb/Applications/RadarManager.app 2>/dev/null || true
 fi

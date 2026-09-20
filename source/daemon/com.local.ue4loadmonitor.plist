@@ -13,9 +13,9 @@
         <string>/var/jb/usr/local/libexec/ue4loadmonitor</string>
     </array>
     <key>RunAtLoad</key>
-    <true/>
+    <false/>
     <key>KeepAlive</key>
-    <true/>
+    <false/>
     <key>UserName</key>
     <string>root</string>
     <key>ThrottleInterval</key>

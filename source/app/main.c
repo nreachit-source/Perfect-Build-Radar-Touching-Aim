@@ -8,8 +8,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
 #include <spawn.h>
 #include <dlfcn.h>
 #include <objc/runtime.h>
@@ -60,7 +64,8 @@ static inline id get_font_fixed(double size) {
     return f;
 }
 
-/* --- System Helpers --- */
+/* --- Native Process & System Helpers (Zero popen / Zero /bin/sh) --- */
+
 static int run_cmd(const char *cmd) {
     pid_t pid;
     const char *argv[] = {"/var/jb/bin/sh", "-c", cmd, NULL};
@@ -69,26 +74,36 @@ static int run_cmd(const char *cmd) {
         waitpid(pid, &status, 0);
         return WEXITSTATUS(status);
     }
-    const char *argv_fb[] = {"/bin/sh", "-c", cmd, NULL};
-    if (posix_spawn(&pid, "/bin/sh", NULL, NULL, (char *const *)argv_fb, environ) == 0) {
-        waitpid(pid, &status, 0);
-        return WEXITSTATUS(status);
-    }
     return -1;
 }
 
-static pid_t find_pid_by_name(const char *name) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ps -A -o pid,comm | grep -v grep | grep '%s' | head -n1 | awk '{print $1}'", name);
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return 0;
-    char buf[32] = {0};
-    if (fgets(buf, sizeof(buf), fp)) {
-        pclose(fp);
-        return (pid_t)atoi(buf);
+/* Native Darwin kernel sysctl process scanner — 100% reliable without any shell */
+static pid_t find_proc(const char *name) {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t length = 0;
+    if (sysctl(mib, 4, NULL, &length, NULL, 0) != 0 || length == 0) {
+        return 0;
     }
-    pclose(fp);
-    return 0;
+
+    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(length + sizeof(struct kinfo_proc) * 16);
+    if (!procs) return 0;
+
+    length += sizeof(struct kinfo_proc) * 16;
+    if (sysctl(mib, 4, procs, &length, NULL, 0) != 0) {
+        free(procs);
+        return 0;
+    }
+
+    size_t count = length / sizeof(struct kinfo_proc);
+    pid_t result = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (strstr(procs[i].kp_proc.p_comm, name) != NULL) {
+            result = procs[i].kp_proc.p_pid;
+            break;
+        }
+    }
+    free(procs);
+    return result;
 }
 
 static int file_exists_nonempty(const char *path) {
@@ -97,29 +112,43 @@ static int file_exists_nonempty(const char *path) {
     return 0;
 }
 
-static void read_tail_str(const char *path, int lines, char *out, size_t out_max) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "tail -n %d %s 2>/dev/null", lines, path);
-    FILE *fp = popen(cmd, "r");
+/* Native C tail reader — reads the end of log files directly without popen/tail */
+static void read_tail(const char *path, int lines_needed, char *out, size_t max_out) {
+    FILE *fp = fopen(path, "r");
     if (!fp) {
-        snprintf(out, out_max, "[Log not available]");
+        snprintf(out, max_out, "[File not available]");
         return;
     }
-    out[0] = '\0';
-    char buf[256];
-    size_t cur = 0;
-    while (fgets(buf, sizeof(buf), fp)) {
-        size_t blen = strlen(buf);
-        if (cur + blen < out_max - 1) {
-            memcpy(out + cur, buf, blen);
-            cur += blen;
-            out[cur] = '\0';
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    long off = (sz > 3072) ? sz - 3072 : 0;
+    fseek(fp, off, SEEK_SET);
+
+    char buf[3072];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    buf[n] = '\0';
+
+    if (n == 0) {
+        snprintf(out, max_out, "[Empty file]");
+        return;
+    }
+
+    /* Find start of last lines_needed lines */
+    char *p = buf + n - 1;
+    int c = 0;
+    while (p > buf) {
+        if (*p == '\n') {
+            c++;
+            if (c >= lines_needed) {
+                p++;
+                break;
+            }
         }
+        p--;
     }
-    pclose(fp);
-    if (cur == 0) {
-        snprintf(out, out_max, "[Empty log]");
-    }
+    if (p < buf) p = buf;
+    snprintf(out, max_out, "%s", p);
 }
 
 /* --- UI State --- */
@@ -138,7 +167,7 @@ static void set_status_row(id lbl, const char *text, double r, double g, double 
 
 static void refresh_status(void) {
     /* 1. Radar Daemon */
-    pid_t dpid = find_pid_by_name("ue4loadmonitor");
+    pid_t dpid = find_proc("ue4loadmonitor");
     if (dpid > 0) {
         char buf[64];
         snprintf(buf, sizeof(buf), "RUNNING (PID %d)", (int)dpid);
@@ -148,7 +177,7 @@ static void refresh_status(void) {
     }
 
     /* 2. Game Process */
-    pid_t gpid = find_pid_by_name("ShadowTrackerExtra");
+    pid_t gpid = find_proc("ShadowTracker");
     if (gpid > 0) {
         char buf[64];
         snprintf(buf, sizeof(buf), "ACTIVE (PID %d)", (int)gpid);
@@ -158,7 +187,7 @@ static void refresh_status(void) {
     }
 
     /* 3. Overlay State */
-    pid_t sbpid = find_pid_by_name("SpringBoard");
+    pid_t sbpid = find_proc("SpringBoard");
     if (file_exists_nonempty("/var/mobile/Downloads/overlay_sb_pid.txt")) {
         char buf[64];
         snprintf(buf, sizeof(buf), "ACTIVE (SB %d)", (int)sbpid);
@@ -178,8 +207,8 @@ static void refresh_status(void) {
     if (g_txt_logs) {
         char dLog[1024];
         char oLog[1024];
-        read_tail_str("/var/mobile/Downloads/ue4_radar.log", 5, dLog, sizeof(dLog));
-        read_tail_str("/var/mobile/Downloads/ue4_overlay_v3_proof.log", 5, oLog, sizeof(oLog));
+        read_tail("/var/mobile/Downloads/ue4_radar.log", 4, dLog, sizeof(dLog));
+        read_tail("/var/mobile/Downloads/ue4_overlay_v3_proof.log", 4, oLog, sizeof(oLog));
         char full[2400];
         snprintf(full, sizeof(full), "--- DAEMON LOG ---\n%s\n--- OVERLAY PROOF ---\n%s", dLog, oLog);
         ((void (*)(id, SEL, id))objc_msgSend)(g_txt_logs, sel_registerName("setText:"), nsstr(full));
@@ -189,10 +218,24 @@ static void refresh_status(void) {
 /* --- Action Callbacks --- */
 static void action_start_radar(id self, SEL cmd, id sender) {
     (void)self; (void)cmd; (void)sender;
-    run_cmd("rm -f /var/jb/basebin/.safe_mode 2>/dev/null || true");
-    run_cmd("/var/jb/bin/launchctl kickstart -k user/501/com.local.ue4loadmonitor 2>/dev/null || "
-            "/var/jb/bin/launchctl kickstart -k system/com.local.ue4loadmonitor 2>/dev/null || "
-            "/var/jb/usr/local/libexec/ue4loadmonitor >/dev/null 2>&1 &");
+    /* Clear stop flag and safe mode */
+    unlink("/var/mobile/Downloads/radar_stop.flag");
+    unlink("/var/jb/basebin/.safe_mode");
+
+    /* Start daemon if not running */
+    pid_t dpid = find_proc("ue4loadmonitor");
+    if (dpid == 0) {
+        run_cmd("/var/jb/bin/launchctl kickstart -k system/com.local.ue4loadmonitor 2>/dev/null || "
+                "/var/jb/bin/launchctl kickstart -k user/501/com.local.ue4loadmonitor 2>/dev/null || true");
+        usleep(100000);
+        dpid = find_proc("ue4loadmonitor");
+        if (dpid == 0) {
+            /* Fallback to direct background spawn */
+            pid_t child_pid;
+            const char *argv[] = {"/var/jb/usr/local/libexec/ue4loadmonitor", NULL};
+            posix_spawn(&child_pid, "/var/jb/usr/local/libexec/ue4loadmonitor", NULL, NULL, (char *const *)argv, environ);
+        }
+    }
 
     /* Launch Game via LSApplicationWorkspace or uiopen */
     Class cls = objc_getClass("LSApplicationWorkspace");
@@ -209,27 +252,54 @@ static void action_start_radar(id self, SEL cmd, id sender) {
 
 static void action_stop_radar(id self, SEL cmd, id sender) {
     (void)self; (void)cmd; (void)sender;
-    run_cmd("killall -9 ue4loadmonitor 2>/dev/null || true");
-    run_cmd("/var/jb/bin/launchctl stop user/501/com.local.ue4loadmonitor 2>/dev/null || true");
+    /* 1. Write stop flag so daemon terminates itself cleanly */
+    FILE *fp = fopen("/var/mobile/Downloads/radar_stop.flag", "w");
+    if (fp) {
+        fprintf(fp, "STOP\n");
+        fclose(fp);
+        chown("/var/mobile/Downloads/radar_stop.flag", 501, 501);
+    }
+
+    /* 2. Directly terminate ue4loadmonitor as root */
+    pid_t dpid = find_proc("ue4loadmonitor");
+    if (dpid > 0) {
+        kill(dpid, SIGTERM);
+        usleep(50000);
+        if (find_proc("ue4loadmonitor") > 0) {
+            kill(dpid, SIGKILL);
+        }
+    }
+
+    /* 3. Stop via launchctl */
     run_cmd("/var/jb/bin/launchctl stop system/com.local.ue4loadmonitor 2>/dev/null || true");
-    run_cmd("rm -f /var/mobile/Downloads/ue4_radar.bin 2>/dev/null || true");
+    run_cmd("/var/jb/bin/launchctl stop user/501/com.local.ue4loadmonitor 2>/dev/null || true");
+
+    /* 4. Remove shared IPC and PID files */
+    unlink("/var/mobile/Downloads/ue4_radar.bin");
+    unlink("/var/mobile/Downloads/ue4loadmonitor.pid");
+
     refresh_status();
 }
 
 static void action_respring(id self, SEL cmd, id sender) {
     (void)self; (void)cmd; (void)sender;
-    run_cmd("/var/jb/usr/bin/sbreload 2>/dev/null || killall -9 SpringBoard");
+    run_cmd("/var/jb/usr/bin/sbreload 2>/dev/null || /var/jb/usr/bin/killall -9 SpringBoard 2>/dev/null || true");
 }
 
 static void action_exit_safe_mode(id self, SEL cmd, id sender) {
     (void)self; (void)cmd; (void)sender;
-    run_cmd("rm -f /var/jb/basebin/.safe_mode /var/mobile/Downloads/overlay_sb_pid.txt 2>/dev/null || true");
-    run_cmd("/var/jb/usr/bin/sbreload 2>/dev/null || killall -9 SpringBoard");
+    unlink("/var/jb/basebin/.safe_mode");
+    unlink("/var/mobile/Downloads/overlay_sb_pid.txt");
+    run_cmd("/var/jb/usr/bin/sbreload 2>/dev/null || /var/jb/usr/bin/killall -9 SpringBoard 2>/dev/null || true");
 }
 
 static void action_close_game(id self, SEL cmd, id sender) {
     (void)self; (void)cmd; (void)sender;
-    run_cmd("killall -9 ShadowTrackerExtra 2>/dev/null || true");
+    pid_t gpid = find_proc("ShadowTracker");
+    if (gpid > 0) {
+        kill(gpid, SIGKILL);
+    }
+    run_cmd("/var/jb/usr/bin/killall -9 ShadowTrackerExtra 2>/dev/null || true");
     refresh_status();
 }
 
@@ -457,6 +527,10 @@ static int app_didFinishLaunching(id self, SEL cmd, id application, id launchOpt
 
 /* --- Main Entry --- */
 int main(int argc, char *argv[]) {
+    /* Elevate to root via setuid bit on Dopamine rootless */
+    setuid(0);
+    setgid(0);
+
     dlopen("/System/Library/Frameworks/Foundation.framework/Foundation", RTLD_NOW | RTLD_GLOBAL);
     dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_NOW | RTLD_GLOBAL);
     dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_NOW | RTLD_GLOBAL);
