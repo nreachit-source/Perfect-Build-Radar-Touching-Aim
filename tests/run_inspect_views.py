@@ -23,7 +23,7 @@ print("Pushing inspect_views.dylib via AFC...")
 subprocess.run([str(py), "-m", "pymobiledevice3", "afc", "push",
                 str(out_dylib), "/inspect_views.dylib"], check=True)
 
-ps_out = run_script("ps -ef")
+ps_out = run_script("ps -ef | grep SpringBoard.app/SpringBoard | grep -v grep")
 sb_pid = None
 for line in ps_out.splitlines():
     if "SpringBoard.app/SpringBoard" in line:
@@ -33,7 +33,7 @@ for line in ps_out.splitlines():
             break
 
 if not sb_pid:
-    raise RuntimeError(f"Could not find SpringBoard PID")
+    raise RuntimeError(f"Could not find SpringBoard PID from: {ps_out}")
 
 print(f"Found SpringBoard PID: {sb_pid}")
 

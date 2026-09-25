@@ -92,6 +92,10 @@ typedef double CGFloat;
 typedef struct { CGFloat x, y; } CGPoint;
 typedef struct { CGFloat width, height; } CGSize;
 typedef struct { CGPoint origin; CGSize size; } CGRect;
+typedef struct CGAffineTransform {
+    CGFloat a, b, c, d;
+    CGFloat tx, ty;
+} CGAffineTransform;
 
 static inline CGRect CGRectMake_f(CGFloat x, CGFloat y, CGFloat w, CGFloat h) {
     CGRect r = {{x, y}, {w, h}};
@@ -103,9 +107,28 @@ static inline CGPoint CGPointMake_f(CGFloat x, CGFloat y) {
     return p;
 }
 
+static inline CGAffineTransform CGAffineTransformMake_f(CGFloat a, CGFloat b, CGFloat c, CGFloat d, CGFloat tx, CGFloat ty) {
+    CGAffineTransform t = {a, b, c, d, tx, ty};
+    return t;
+}
+
+static inline CGAffineTransform CGAffineTransformMakeRotation_f(CGFloat angle) {
+    CGFloat ca = cos(angle);
+    CGFloat sa = sin(angle);
+    return CGAffineTransformMake_f(ca, sa, -sa, ca, 0.0, 0.0);
+}
+
+static inline CGAffineTransform CGAffineTransformIdentity_f(void) {
+    return CGAffineTransformMake_f(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+}
+
 static id nsstr(const char *s);
 static double g_screen_w = 0.0;
 static double g_screen_h = 0.0;
+static BOOL g_scene_is_portrait = NO;
+static double g_scene_w = 0.0;
+static double g_scene_h = 0.0;
+static int g_orientation_override = 0; /* 0=Auto, 1=LandscapeRight (ori=3), 2=LandscapeLeft (ori=4) */
 
 static inline BOOL in_rect(CGPoint p, CGRect r) {
     return p.x >= r.origin.x && p.y >= r.origin.y &&
@@ -692,6 +715,7 @@ static id g_btn_sound_radar     = nil;
 static id g_btn_knocked_timer   = nil;
 static id g_btn_auto_evade      = nil;
 static id g_btn_aim_smooth      = nil;
+static id g_btn_orientation     = nil;
 static id g_btn_stop_radar      = nil;
 
 /* Typography & Colors cached */
@@ -864,6 +888,12 @@ static void update_menu_buttons(void) {
 
     title(g_btn_aim_smooth, g_feat_aim_smooth ? "Aim Smooth: ON" : "Aim Smooth: OFF");
     style_toggle_button(g_btn_aim_smooth, g_feat_aim_smooth);
+
+    if (g_btn_orientation) {
+        const char *ori_names[] = { "Ori: Auto", "Ori: LandRight", "Ori: LandLeft" };
+        title(g_btn_orientation, ori_names[g_orientation_override % 3]);
+        style_toggle_button(g_btn_orientation, g_orientation_override != 0);
+    }
 
     hidden(g_radar_view, !g_feat_radar);
     if (g_aim_window) hidden(g_aim_window, !g_feat_touch_aim || g_menu_open);
@@ -2006,34 +2036,106 @@ static id window_hitTest(id self, SEL cmd, CGPoint point, id event) {
         g_menu_view, sel_registerName("hitTest:withEvent:"), p, event);
 }
 
+static void apply_control_window(id window, id content_view, CGRect land_rect, CGFloat content_scale) {
+    if (!window) return;
+    double lx = land_rect.origin.x, ly = land_rect.origin.y;
+    double lw = land_rect.size.width, lh = land_rect.size.height;
+
+    id vc = ((id (*)(id, SEL))objc_msgSend)(window, sel_registerName("rootViewController"));
+    id rv = vc ? ((id (*)(id, SEL))objc_msgSend)(vc, sel_registerName("view")) : nil;
+
+    if (!g_scene_is_portrait) {
+        ((void (*)(id, SEL, CGRect))objc_msgSend)(window, sel_registerName("setFrame:"), land_rect);
+        ((void (*)(id, SEL, CGRect))objc_msgSend)(window, sel_registerName("setBounds:"), CGRectMake_f(0, 0, lw, lh));
+        if (rv) {
+            ((void (*)(id, SEL, NSUInteger))objc_msgSend)(rv, sel_registerName("setAutoresizingMask:"), 0);
+            ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(rv, sel_registerName("setTransform:"), CGAffineTransformIdentity_f());
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(rv, sel_registerName("setBounds:"), CGRectMake_f(0, 0, lw, lh));
+            ((void (*)(id, SEL, CGPoint))objc_msgSend)(rv, sel_registerName("setCenter:"), CGPointMake_f(lw / 2.0, lh / 2.0));
+        }
+        if (content_view) {
+            if (content_scale > 0.0 && content_scale != 1.0) {
+                ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(content_view, sel_registerName("setTransform:"),
+                    CGAffineTransformMake_f(content_scale, 0, 0, content_scale, 0, 0));
+                ((void (*)(id, SEL, CGRect))objc_msgSend)(content_view, sel_registerName("setBounds:"), CGRectMake_f(0, 0, lw / content_scale, lh / content_scale));
+                ((void (*)(id, SEL, CGPoint))objc_msgSend)(content_view, sel_registerName("setCenter:"), CGPointMake_f(lw / 2.0, lh / 2.0));
+            } else {
+                ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(content_view, sel_registerName("setTransform:"), CGAffineTransformIdentity_f());
+                ((void (*)(id, SEL, CGRect))objc_msgSend)(content_view, sel_registerName("setFrame:"), CGRectMake_f(0, 0, lw, lh));
+            }
+        }
+        return;
+    }
+
+    /* Scene is Portrait: place window in portrait space and rotate root view to match Landscape */
+    NSInteger ori = g_current_orientation;
+    CGRect win_f;
+    CGFloat angle = (ori == 4) ? -(CGFloat)M_PI_2 : (CGFloat)M_PI_2;
+    if (ori == 4) {
+        /* LandscapeLeft: panel X = ly, panel Y = g_scene_h - lx - lw */
+        win_f = CGRectMake_f(ly, g_scene_h - lx - lw, lh, lw);
+    } else {
+        /* LandscapeRight (default): panel X = g_scene_w - ly - lh, panel Y = lx */
+        win_f = CGRectMake_f(g_scene_w - ly - lh, lx, lh, lw);
+    }
+
+    ((void (*)(id, SEL, CGRect))objc_msgSend)(window, sel_registerName("setFrame:"), win_f);
+    ((void (*)(id, SEL, CGRect))objc_msgSend)(window, sel_registerName("setBounds:"), CGRectMake_f(0, 0, lh, lw));
+
+    if (rv) {
+        ((void (*)(id, SEL, NSUInteger))objc_msgSend)(rv, sel_registerName("setAutoresizingMask:"), 0);
+        ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(rv, sel_registerName("setTransform:"), CGAffineTransformIdentity_f());
+        ((void (*)(id, SEL, CGRect))objc_msgSend)(rv, sel_registerName("setBounds:"), CGRectMake_f(0, 0, lw, lh));
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(rv, sel_registerName("setCenter:"), CGPointMake_f(lh / 2.0, lw / 2.0));
+        ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(rv, sel_registerName("setTransform:"), CGAffineTransformMakeRotation_f(angle));
+    }
+    if (content_view) {
+        if (content_scale > 0.0 && content_scale != 1.0) {
+            ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(content_view, sel_registerName("setTransform:"),
+                CGAffineTransformMake_f(content_scale, 0, 0, content_scale, 0, 0));
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(content_view, sel_registerName("setBounds:"), CGRectMake_f(0, 0, lw / content_scale, lh / content_scale));
+            ((void (*)(id, SEL, CGPoint))objc_msgSend)(content_view, sel_registerName("setCenter:"), CGPointMake_f(lw / 2.0, lh / 2.0));
+        } else {
+            ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(content_view, sel_registerName("setTransform:"), CGAffineTransformIdentity_f());
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(content_view, sel_registerName("setFrame:"), CGRectMake_f(0, 0, lw, lh));
+        }
+    }
+}
+
 /* Only these three small windows accept input. The full-screen drawing window
  * is noninteractive, including when the menu is expanded. */
 static void layout_controls(void) {
     if (!g_button_window || !g_menu_window || !g_menu_view) return;
     double edge = 6.0;
-    g_button_rect.origin.x = fmax(edge, fmin(g_button_rect.origin.x, g_screen_w - 48.0 - edge));
-    g_button_rect.origin.y = fmax(edge, fmin(g_button_rect.origin.y, g_screen_h - 48.0 - edge));
-    ((void (*)(id, SEL, CGRect))objc_msgSend)(g_button_window, sel_registerName("setFrame:"), g_button_rect);
-    ((void (*)(id, SEL, CGRect))objc_msgSend)(g_drag_button, sel_registerName("setFrame:"), CGRectMake_f(0, 0, 48, 48));
+    double max_w = g_screen_w > 10.0 ? g_screen_w : 1024.0;
+    double max_h = g_screen_h > 10.0 ? g_screen_h : 768.0;
+    g_button_rect.origin.x = fmax(edge, fmin(g_button_rect.origin.x, max_w - 48.0 - edge));
+    g_button_rect.origin.y = fmax(edge, fmin(g_button_rect.origin.y, max_h - 48.0 - edge));
+    apply_control_window(g_button_window, g_drag_button, g_button_rect, 1.0);
 
     if (g_aim_window && g_aim_button) {
-        g_aim_rect.origin.x = fmax(edge, fmin(g_aim_rect.origin.x, g_screen_w - 56.0 - edge));
-        g_aim_rect.origin.y = fmax(edge, fmin(g_aim_rect.origin.y, g_screen_h - 56.0 - edge));
-        ((void (*)(id, SEL, CGRect))objc_msgSend)(g_aim_window, sel_registerName("setFrame:"), g_aim_rect);
-        ((void (*)(id, SEL, CGRect))objc_msgSend)(g_aim_button, sel_registerName("setFrame:"), CGRectMake_f(0, 0, 56, 56));
+        g_aim_rect.origin.x = fmax(edge, fmin(g_aim_rect.origin.x, max_w - 56.0 - edge));
+        g_aim_rect.origin.y = fmax(edge, fmin(g_aim_rect.origin.y, max_h - 56.0 - edge));
+        apply_control_window(g_aim_window, g_aim_button, g_aim_rect, 1.0);
         hidden(g_aim_window, !g_feat_touch_aim || g_menu_open);
     }
 
     double margin = 32.0;
-    double scale = fmin(1.0, fmin((g_screen_w - 2 * margin) / MENU_WIDTH, (g_screen_h - 2 * margin) / MENU_HEIGHT));
-    g_menu_rect = CGRectMake_f((g_screen_w - MENU_WIDTH * scale)/2, (g_screen_h - MENU_HEIGHT * scale)/2, MENU_WIDTH * scale, MENU_HEIGHT * scale);
-    ((void (*)(id, SEL, CGRect))objc_msgSend)(g_menu_window, sel_registerName("setFrame:"), g_menu_rect);
-    typedef struct { double a,b,c,d,tx,ty; } Transform;
-    ((void (*)(id, SEL, Transform))objc_msgSend)(g_menu_view, sel_registerName("setTransform:"), (Transform){scale,0,0,scale,0,0});
-    ((void (*)(id, SEL, CGRect))objc_msgSend)(g_menu_view, sel_registerName("setBounds:"), CGRectMake_f(0,0,MENU_WIDTH,MENU_HEIGHT));
-    ((void (*)(id, SEL, CGPoint))objc_msgSend)(g_menu_view, sel_registerName("setCenter:"), (CGPoint){g_menu_rect.size.width/2,g_menu_rect.size.height/2});
+    double scale = fmin(1.0, fmin((max_w - 2 * margin) / MENU_WIDTH, (max_h - 2 * margin) / MENU_HEIGHT));
+    g_menu_rect = CGRectMake_f((max_w - MENU_WIDTH * scale)/2, (max_h - MENU_HEIGHT * scale)/2, MENU_WIDTH * scale, MENU_HEIGHT * scale);
+    apply_control_window(g_menu_window, g_menu_view, g_menu_rect, scale);
     hidden(g_menu_window, !g_menu_open);
     hidden(g_button_window, g_menu_open);
+}
+
+static id get_touch_ref_view(void) {
+    if (!g_window) return nil;
+    id rvc = ((id (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("rootViewController"));
+    if (rvc) {
+        id rv = ((id (*)(id, SEL))objc_msgSend)(rvc, sel_registerName("view"));
+        if (rv) return rv;
+    }
+    return g_window;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2045,7 +2147,7 @@ static void btn_touchesBegan(id self, SEL cmd, id touches, id event) {
     id touch = ((id (*)(id, SEL))objc_msgSend)(touches, sel_registerName("anyObject"));
     if (touch) {
         g_drag_start_touch = ((CGPoint (*)(id, SEL, id))objc_msgSend)(
-            touch, sel_registerName("locationInView:"), g_window);
+            touch, sel_registerName("locationInView:"), get_touch_ref_view());
         CGRect f = ((CGRect (*)(id, SEL))objc_msgSend)(self, sel_registerName("frame"));
         (void)f;
         g_drag_start_origin = g_button_rect.origin;
@@ -2058,19 +2160,20 @@ static void btn_touchesMoved(id self, SEL cmd, id touches, id event) {
     id touch = ((id (*)(id, SEL))objc_msgSend)(touches, sel_registerName("anyObject"));
     if (touch) {
         CGPoint cur = ((CGPoint (*)(id, SEL, id))objc_msgSend)(
-            touch, sel_registerName("locationInView:"), g_window);
+            touch, sel_registerName("locationInView:"), get_touch_ref_view());
         double dx = cur.x - g_drag_start_touch.x;
         double dy = cur.y - g_drag_start_touch.y;
         if (fabs(dx) > 4.0 || fabs(dy) > 4.0) {
             g_is_dragging = YES;
-            CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("bounds"));
+            double max_w = g_screen_w > 10.0 ? g_screen_w : 1024.0;
+            double max_h = g_screen_h > 10.0 ? g_screen_h : 768.0;
             CGRect f = g_button_rect;
             double new_x = g_drag_start_origin.x + dx;
             double new_y = g_drag_start_origin.y + dy;
             if (new_x < 4.0) new_x = 4.0;
             if (new_y < 4.0) new_y = 4.0;
-            if (new_x + f.size.width > bounds.size.width - 4.0) new_x = bounds.size.width - f.size.width - 4.0;
-            if (new_y + f.size.height > bounds.size.height - 4.0) new_y = bounds.size.height - f.size.height - 4.0;
+            if (new_x + f.size.width > max_w - 4.0) new_x = max_w - f.size.width - 4.0;
+            if (new_y + f.size.height > max_h - 4.0) new_y = max_h - f.size.height - 4.0;
             f.origin.x = new_x;
             f.origin.y = new_y;
             g_button_rect = f;
@@ -2105,7 +2208,7 @@ static void aim_btn_touchesBegan(id self, SEL cmd, id touches, id event) {
     id touch = ((id (*)(id, SEL))objc_msgSend)(touches, sel_registerName("anyObject"));
     if (touch) {
         g_aim_drag_start_touch = ((CGPoint (*)(id, SEL, id))objc_msgSend)(
-            touch, sel_registerName("locationInView:"), g_window);
+            touch, sel_registerName("locationInView:"), get_touch_ref_view());
         g_aim_drag_start_origin = g_aim_rect.origin;
         g_aim_is_dragging = NO;
         g_finger_drag_x = 0.0;
@@ -2120,7 +2223,7 @@ static void aim_btn_touchesMoved(id self, SEL cmd, id touches, id event) {
     id touch = ((id (*)(id, SEL))objc_msgSend)(touches, sel_registerName("anyObject"));
     if (touch) {
         CGPoint cur = ((CGPoint (*)(id, SEL, id))objc_msgSend)(
-            touch, sel_registerName("locationInView:"), g_window);
+            touch, sel_registerName("locationInView:"), get_touch_ref_view());
         double dx = cur.x - g_aim_drag_start_touch.x;
         double dy = cur.y - g_aim_drag_start_touch.y;
         g_finger_drag_x = dx;
@@ -2128,14 +2231,15 @@ static void aim_btn_touchesMoved(id self, SEL cmd, id touches, id event) {
 
         if (fabs(dx) > 4.0 || fabs(dy) > 4.0) {
             g_aim_is_dragging = YES;
-            CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("bounds"));
+            double max_w = g_screen_w > 10.0 ? g_screen_w : 1024.0;
+            double max_h = g_screen_h > 10.0 ? g_screen_h : 768.0;
             CGRect f = g_aim_rect;
             double new_x = g_aim_drag_start_origin.x + dx;
             double new_y = g_aim_drag_start_origin.y + dy;
             if (new_x < 4.0) new_x = 4.0;
             if (new_y < 4.0) new_y = 4.0;
-            if (new_x + f.size.width > bounds.size.width - 4.0) new_x = bounds.size.width - f.size.width - 4.0;
-            if (new_y + f.size.height > bounds.size.height - 4.0) new_y = bounds.size.height - f.size.height - 4.0;
+            if (new_x + f.size.width > max_w - 4.0) new_x = max_w - f.size.width - 4.0;
+            if (new_y + f.size.height > max_h - 4.0) new_y = max_h - f.size.height - 4.0;
             f.origin.x = new_x;
             f.origin.y = new_y;
             g_aim_rect = f;
@@ -2243,6 +2347,11 @@ static void action_toggle_sound_radar(id self, SEL cmd, id sender)     { (void)s
 static void action_toggle_knocked_timer(id self, SEL cmd, id sender)   { (void)self; (void)cmd; (void)sender; g_feat_knocked_timer = !g_feat_knocked_timer; update_menu_buttons(); }
 static void action_toggle_auto_evade(id self, SEL cmd, id sender)      { (void)self; (void)cmd; (void)sender; g_feat_auto_evade = !g_feat_auto_evade; update_menu_buttons(); }
 static void action_toggle_aim_smooth(id self, SEL cmd, id sender)      { (void)self; (void)cmd; (void)sender; g_feat_aim_smooth = !g_feat_aim_smooth; update_menu_buttons(); }
+static void action_toggle_orientation(id self, SEL cmd, id sender) {
+    (void)self; (void)cmd; (void)sender;
+    g_orientation_override = (g_orientation_override + 1) % 3;
+    update_menu_buttons();
+}
 static void action_close_menu(id self, SEL cmd, id sender) {
     (void)self; (void)cmd; (void)sender;
     if (g_menu_open) toggle_menu();
@@ -2399,14 +2508,40 @@ static void timer_tick(id self, SEL cmd, id timer) {
     double raw_h = cur_bounds.size.height;
     if (raw_w <= 10.0 || raw_h <= 10.0) { raw_w = 1024.0; raw_h = 768.0; }
 
+    CGRect scene_bounds = CGRectMake_f(0, 0, raw_w, raw_h);
+    if (scene && safe_responds(scene, "coordinateSpace")) {
+        id cs = ((id (*)(id, SEL))objc_msgSend)(scene, sel_registerName("coordinateSpace"));
+        if (cs && safe_responds(cs, "bounds")) {
+            scene_bounds = ((CGRect (*)(id, SEL))objc_msgSend)(cs, sel_registerName("bounds"));
+        }
+    }
+    if (scene_bounds.size.width <= 10.0 || scene_bounds.size.height <= 10.0) {
+        scene_bounds = CGRectMake_f(0, 0, raw_w, raw_h);
+    }
+
     double max_dim = fmax(raw_w, raw_h);
     double min_dim = fmin(raw_w, raw_h);
+
+    BOOL scene_is_portrait = (scene_bounds.size.width < scene_bounds.size.height);
+    double scene_w = scene_bounds.size.width;
+    double scene_h = scene_bounds.size.height;
+    if (scene_w <= 10.0 || scene_h <= 10.0) {
+        scene_w = scene_is_portrait ? min_dim : max_dim;
+        scene_h = scene_is_portrait ? max_dim : min_dim;
+    }
+    g_scene_is_portrait = scene_is_portrait;
+    g_scene_w = scene_w;
+    g_scene_h = scene_h;
 
     /* PUBG Mobile (ShadowTrackerExtra) is always a landscape application.
      * When telemetry is active, or raw_w > raw_h, or interface orientation is landscape,
      * enforce landscape bounds. */
     BOOL is_landscape = (ori == 3 || ori == 4 || raw_w > raw_h || g_snapshot.header.status >= 1);
-    if (is_landscape) {
+    if (g_orientation_override == 1) {
+        g_current_orientation = 3; /* Force LandscapeRight */
+    } else if (g_orientation_override == 2) {
+        g_current_orientation = 4; /* Force LandscapeLeft */
+    } else if (is_landscape) {
         if (ori == 4) g_current_orientation = 4;
         else if (ori == 3) g_current_orientation = 3;
         else if (dev_ori == 4) g_current_orientation = 4;
@@ -2420,31 +2555,63 @@ static void timer_tick(id self, SEL cmd, id timer) {
 
     double target_w = is_landscape ? max_dim : min_dim;
     double target_h = is_landscape ? min_dim : max_dim;
-    CGRect target_bounds = CGRectMake_f(0, 0, target_w, target_h);
 
     static NSInteger s_last_orientation = 0;
-    BOOL bounds_changed = (fabs(target_w - g_screen_w) > 1.0 || fabs(target_h - g_screen_h) > 1.0 || g_current_orientation != s_last_orientation);
+    static BOOL s_last_scene_is_portrait = NO;
+    BOOL bounds_changed = (fabs(target_w - g_screen_w) > 1.0 || fabs(target_h - g_screen_h) > 1.0 ||
+                           g_current_orientation != s_last_orientation ||
+                           g_scene_is_portrait != s_last_scene_is_portrait);
 
     if (bounds_changed || g_frame_counter % 20 == 1) {
         g_screen_w = target_w;
         g_screen_h = target_h;
         s_last_orientation = g_current_orientation;
+        s_last_scene_is_portrait = g_scene_is_portrait;
 
         if (g_window) {
-            ((void (*)(id, SEL, CGRect))objc_msgSend)(g_window, sel_registerName("setFrame:"), target_bounds);
             id root_vc = ((id (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("rootViewController"));
-            if (root_vc) {
-                id rv = ((id (*)(id, SEL))objc_msgSend)(root_vc, sel_registerName("view"));
-                if (rv) ((void (*)(id, SEL, CGRect))objc_msgSend)(rv, sel_registerName("setFrame:"), target_bounds);
+            id rv = root_vc ? ((id (*)(id, SEL))objc_msgSend)(root_vc, sel_registerName("view")) : nil;
+
+            if (g_scene_is_portrait) {
+                CGRect win_frame = CGRectMake_f(0, 0, scene_w, scene_h);
+                ((void (*)(id, SEL, CGRect))objc_msgSend)(g_window, sel_registerName("setFrame:"), win_frame);
+                ((void (*)(id, SEL, CGRect))objc_msgSend)(g_window, sel_registerName("setBounds:"), win_frame);
+                if (rv) {
+                    CGFloat angle = (g_current_orientation == 4) ? -(CGFloat)M_PI_2 : (CGFloat)M_PI_2;
+                    ((void (*)(id, SEL, NSUInteger))objc_msgSend)(rv, sel_registerName("setAutoresizingMask:"), 0);
+                    ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(rv, sel_registerName("setTransform:"), CGAffineTransformIdentity_f());
+                    ((void (*)(id, SEL, CGRect))objc_msgSend)(rv, sel_registerName("setBounds:"), CGRectMake_f(0, 0, max_dim, min_dim));
+                    ((void (*)(id, SEL, CGPoint))objc_msgSend)(rv, sel_registerName("setCenter:"), CGPointMake_f(scene_w / 2.0, scene_h / 2.0));
+                    ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(rv, sel_registerName("setTransform:"), CGAffineTransformMakeRotation_f(angle));
+                }
+            } else {
+                CGRect win_frame = CGRectMake_f(0, 0, max_dim, min_dim);
+                ((void (*)(id, SEL, CGRect))objc_msgSend)(g_window, sel_registerName("setFrame:"), win_frame);
+                ((void (*)(id, SEL, CGRect))objc_msgSend)(g_window, sel_registerName("setBounds:"), win_frame);
+                if (rv) {
+                    ((void (*)(id, SEL, NSUInteger))objc_msgSend)(rv, sel_registerName("setAutoresizingMask:"), 0);
+                    ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(rv, sel_registerName("setTransform:"), CGAffineTransformIdentity_f());
+                    ((void (*)(id, SEL, CGRect))objc_msgSend)(rv, sel_registerName("setBounds:"), CGRectMake_f(0, 0, max_dim, min_dim));
+                    ((void (*)(id, SEL, CGPoint))objc_msgSend)(rv, sel_registerName("setCenter:"), CGPointMake_f(max_dim / 2.0, min_dim / 2.0));
+                }
             }
         }
-        if (g_esp_view) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_esp_view, sel_registerName("setFrame:"), target_bounds);
+        if (g_esp_view) {
+            ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(g_esp_view, sel_registerName("setTransform:"), CGAffineTransformIdentity_f());
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(g_esp_view, sel_registerName("setFrame:"), CGRectMake_f(0, 0, max_dim, min_dim));
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(g_esp_view, sel_registerName("setBounds:"), CGRectMake_f(0, 0, max_dim, min_dim));
+        }
 
         /* Adapt radar position for Landscape vs Portrait */
         double rx = fmax(10.0, g_screen_w - RADAR_VIEW_SIZE - 32.0);
         double ry = (g_screen_w > g_screen_h) ? 32.0 : 50.0;
-        if (g_radar_view) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_radar_view, sel_registerName("setFrame:"),
-                                                                    CGRectMake_f(rx, ry, RADAR_VIEW_SIZE, RADAR_VIEW_SIZE));
+        if (g_radar_view) {
+            ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(g_radar_view, sel_registerName("setTransform:"), CGAffineTransformIdentity_f());
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(g_radar_view, sel_registerName("setFrame:"),
+                                                        CGRectMake_f(rx, ry, RADAR_VIEW_SIZE, RADAR_VIEW_SIZE));
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(g_radar_view, sel_registerName("setBounds:"),
+                                                        CGRectMake_f(0, 0, RADAR_VIEW_SIZE, RADAR_VIEW_SIZE));
+        }
 
         /* Keep controls laid out and centered */
         layout_controls();
@@ -2716,7 +2883,7 @@ static void vc_loadView(id self, SEL cmd) {
     id v = ((id (*)(id, SEL, CGRect))objc_msgSend)(
         ((id (*)(id, SEL))objc_msgSend)((id)UIView_cls, sel_registerName("alloc")),
         sel_registerName("initWithFrame:"), CGRectMake_f(0, 0, max_dim, min_dim));
-    ((void (*)(id, SEL, NSUInteger))objc_msgSend)(v, sel_registerName("setAutoresizingMask:"), 18);
+    ((void (*)(id, SEL, NSUInteger))objc_msgSend)(v, sel_registerName("setAutoresizingMask:"), 0);
     ((void (*)(id, SEL, id))objc_msgSend)(self, sel_registerName("setView:"), v);
 }
 
@@ -2936,6 +3103,7 @@ static void init_overlay(void) {
         class_addMethod(ActionHelper, sel_registerName("toggleKnockedTimer:"), (IMP)action_toggle_knocked_timer, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("toggleAutoEvade:"), (IMP)action_toggle_auto_evade, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("toggleAimSmooth:"), (IMP)action_toggle_aim_smooth, "v@:@");
+        class_addMethod(ActionHelper, sel_registerName("toggleOrientation:"), (IMP)action_toggle_orientation, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("closeMenu:"), (IMP)action_close_menu, "v@:@");
         class_addMethod(ActionHelper, sel_registerName("stopRadar:"), (IMP)action_stop_radar, "v@:@");
         objc_registerClassPair(ActionHelper);
@@ -3176,8 +3344,9 @@ static void init_overlay(void) {
     g_btn_auto_evade      = make_menu_button(scroll_view, helper, CGRectMake_f(c0, ROW_Y(18), bw, bh), "Evade Alert: ON",  sel_registerName("toggleAutoEvade:"));
     g_btn_aim_smooth      = make_menu_button(scroll_view, helper, CGRectMake_f(c1, ROW_Y(18), bw, bh), "Aim Smooth: ON",  sel_registerName("toggleAimSmooth:"));
 
-    /* Stop Radar Control Button */
-    g_btn_stop_radar      = make_menu_button(scroll_view, helper, CGRectMake_f(c0, ROW_Y(19), bw * 2 + 12.0, bh), "🛑 STOP RADAR (Exit Daemon)", sel_registerName("stopRadar:"));
+    /* Row 19: Orientation Mode Toggle & Stop Radar Control Button */
+    g_btn_orientation     = make_menu_button(scroll_view, helper, CGRectMake_f(c0, ROW_Y(19), bw, bh), "Ori: Auto", sel_registerName("toggleOrientation:"));
+    g_btn_stop_radar      = make_menu_button(scroll_view, helper, CGRectMake_f(c1, ROW_Y(19), bw, bh), "🛑 STOP RADAR", sel_registerName("stopRadar:"));
     id stop_layer = ((id (*)(id, SEL))objc_msgSend)(g_btn_stop_radar, sel_registerName("layer"));
     if (stop_layer) {
         id cg_red = ((id (*)(id, SEL))objc_msgSend)(
