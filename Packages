@@ -7,8 +7,8 @@ Maintainer: Local Development
 Section: Development
 Depends: firmware (>= 13.0)
 Filename: debs/com.local.ue4loadmonitor_1.3.5_iphoneos-arm64.deb
-Size: 78390
-MD5sum: 713fa1d5fc91f961e55bc272eb1c046f
-SHA1: 429daaaba043d39f99dba9e59d91e6a663f28b1b
-SHA256: 95ffe816bce5b9aa42378749631cf42e937e550e80ca1d8b7b660846f09b5dd5
+Size: 79314
+MD5sum: 0398a0b790f9a7d72958392a687bc66a
+SHA1: 6c7c44aa3d796e16b937d3c21821848146e54f45
+SHA256: bbae542f551adbe37ecee8b83403f82faea714aebf49153ebd7f6fa23c6c2066
 

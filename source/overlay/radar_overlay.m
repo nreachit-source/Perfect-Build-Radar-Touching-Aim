@@ -384,9 +384,23 @@ static void hid_touch_event(double norm_x, double norm_y, int touch_state) {
     double hid_x, hid_y;
     screen_to_digitizer_coords(norm_x, norm_y, &hid_x, &hid_y);
 
-    /* Physical portrait panel coordinates on iPhone X (375x812) */
-    double port_px = hid_x * g_panel_w;
-    double port_py = hid_y * g_panel_h;
+    /* Physical portrait panel coordinates */
+    double pw = g_panel_w;
+    double ph = g_panel_h;
+    if (pw <= 10.0 || ph <= 10.0) {
+        id screen = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIScreen"), sel_registerName("mainScreen"));
+        if (screen) {
+            CGRect b = ((CGRect (*)(id, SEL))objc_msgSend)(screen, sel_registerName("bounds"));
+            pw = fmin(b.size.width, b.size.height);
+            ph = fmax(b.size.width, b.size.height);
+            g_panel_w = pw;
+            g_panel_h = ph;
+        } else {
+            pw = 768.0; ph = 1024.0;
+        }
+    }
+    double port_px = hid_x * pw;
+    double port_py = hid_y * ph;
 
     CGPoint touch_pt = CGPointMake_f(port_px, port_py);
 
@@ -1054,13 +1068,17 @@ static BOOL read_snapshot(void) {
 
 static BOOL world_to_screen(rvec3_t world_pos, CGPoint *out_screen, double *out_depth, double w, double h) {
     if (w <= 10.0 || h <= 10.0) {
-        w = g_screen_w > 0 ? g_screen_w : 812.0;
-        h = g_screen_h > 0 ? g_screen_h : 375.0;
+        if (g_screen_w > 10.0 && g_screen_h > 10.0) {
+            w = g_screen_w;
+            h = g_screen_h;
+        } else {
+            id ms = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIScreen"), sel_registerName("mainScreen"));
+            CGRect b = ms ? ((CGRect (*)(id, SEL))objc_msgSend)(ms, sel_registerName("bounds")) : (CGRect){{0,0},{1024,768}};
+            w = fmax(b.size.width, b.size.height);
+            h = fmin(b.size.width, b.size.height);
+        }
     }
-    BOOL is_landscape = (g_current_orientation == 3 || g_current_orientation == 4);
-    if (!is_landscape && g_snapshot.header.status == 2 && g_snapshot.header.camera_valid) {
-        is_landscape = YES;
-    }
+    BOOL is_landscape = (g_current_orientation == 3 || g_current_orientation == 4 || w > h || g_snapshot.header.status >= 1);
     if (is_landscape && w < h) {
         double tmp = w; w = h; h = tmp;
     }
@@ -1125,13 +1143,17 @@ static void esp_drawRect(id self, SEL cmd, CGRect rect) {
     double w = bounds.size.width;
     double h = bounds.size.height;
     if (w <= 10.0 || h <= 10.0) {
-        w = g_screen_w > 0 ? g_screen_w : 812.0;
-        h = g_screen_h > 0 ? g_screen_h : 375.0;
+        if (g_screen_w > 10.0 && g_screen_h > 10.0) {
+            w = g_screen_w;
+            h = g_screen_h;
+        } else {
+            id ms = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIScreen"), sel_registerName("mainScreen"));
+            CGRect b = ms ? ((CGRect (*)(id, SEL))objc_msgSend)(ms, sel_registerName("bounds")) : (CGRect){{0,0},{1024,768}};
+            w = fmax(b.size.width, b.size.height);
+            h = fmin(b.size.width, b.size.height);
+        }
     }
-    BOOL is_landscape = (g_current_orientation == 3 || g_current_orientation == 4);
-    if (!is_landscape && g_snapshot.header.status == 2 && g_snapshot.header.camera_valid) {
-        is_landscape = YES;
-    }
+    BOOL is_landscape = (g_current_orientation == 3 || g_current_orientation == 4 || w > h || g_snapshot.header.status >= 1);
     if (is_landscape && w < h) {
         double tmp = w;
         w = h;
@@ -2330,29 +2352,64 @@ static void timer_tick(id self, SEL cmd, id timer) {
         }
     }
 
-    /* 3. Orientation Triangulation (Scene -> Device -> Live Telemetry) */
-    NSInteger ori = 0;
-    if (scene) ori = (NSInteger)((id (*)(id, SEL))objc_msgSend)(scene, sel_registerName("interfaceOrientation"));
-    if (ori == 0) {
-        Class UIDevice_cls = objc_getClass("UIDevice");
-        if (UIDevice_cls) {
-            id dev = ((id (*)(id, SEL))objc_msgSend)((id)UIDevice_cls, sel_registerName("currentDevice"));
-            if (dev) {
-                NSInteger dev_ori = (NSInteger)((id (*)(id, SEL))objc_msgSend)(dev, sel_registerName("orientation"));
-                if (dev_ori == 3) ori = 3;      /* UIDeviceOrientationLandscapeLeft -> UIInterfaceOrientationLandscapeRight */
-                else if (dev_ori == 4) ori = 4; /* UIDeviceOrientationLandscapeRight -> UIInterfaceOrientationLandscapeLeft */
-                else if (dev_ori == 1) ori = 1;
-                else if (dev_ori == 2) ori = 2;
+    /* 3. Orientation Triangulation (Application -> Scene -> Device -> Live Telemetry) */
+    NSInteger app_ori = 0;
+    Class UIApp_cls = objc_getClass("UIApplication");
+    if (UIApp_cls) {
+        id app = ((id (*)(id, SEL))objc_msgSend)((id)UIApp_cls, sel_registerName("sharedApplication"));
+        if (app) {
+            if (safe_responds(app, "_frontMostAppOrientation")) {
+                app_ori = (NSInteger)((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("_frontMostAppOrientation"));
+            } else if (safe_responds(app, "activeInterfaceOrientation")) {
+                app_ori = (NSInteger)((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("activeInterfaceOrientation"));
+            } else if (safe_responds(app, "statusBarOrientation")) {
+                app_ori = (NSInteger)((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("statusBarOrientation"));
             }
         }
     }
-    BOOL is_landscape = (ori == 3 || ori == 4);
-    if (!is_landscape && g_snapshot.header.status == 2 && g_snapshot.header.camera_valid) {
-        /* When live game camera is tracking, PUBG Mobile on iPhone is landscape */
-        is_landscape = YES;
+
+    NSInteger scene_ori = 0;
+    if (scene) scene_ori = (NSInteger)((id (*)(id, SEL))objc_msgSend)(scene, sel_registerName("interfaceOrientation"));
+
+    NSInteger dev_ori = 0;
+    Class UIDevice_cls = objc_getClass("UIDevice");
+    if (UIDevice_cls) {
+        id dev = ((id (*)(id, SEL))objc_msgSend)((id)UIDevice_cls, sel_registerName("currentDevice"));
+        if (dev) {
+            NSInteger d = (NSInteger)((id (*)(id, SEL))objc_msgSend)(dev, sel_registerName("orientation"));
+            if (d == 3) dev_ori = 3;      /* UIDeviceOrientationLandscapeLeft -> UIInterfaceOrientationLandscapeRight */
+            else if (d == 4) dev_ori = 4; /* UIDeviceOrientationLandscapeRight -> UIInterfaceOrientationLandscapeLeft */
+            else if (d == 1) dev_ori = 1;
+            else if (d == 2) dev_ori = 2;
+        }
     }
+
+    NSInteger ori = 0;
+    if (app_ori == 3 || app_ori == 4) ori = app_ori;
+    else if (scene_ori == 3 || scene_ori == 4) ori = scene_ori;
+    else if (dev_ori == 3 || dev_ori == 4) ori = dev_ori;
+    else if (app_ori >= 1 && app_ori <= 4) ori = app_ori;
+    else if (scene_ori >= 1 && scene_ori <= 4) ori = scene_ori;
+    else if (dev_ori >= 1 && dev_ori <= 4) ori = dev_ori;
+
+    /* 4. Dynamic Screen Dimensions & Midpoint Refresh */
+    id mainScreen = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIScreen"), sel_registerName("mainScreen"));
+    CGRect cur_bounds = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, sel_registerName("bounds"));
+    double raw_w = cur_bounds.size.width;
+    double raw_h = cur_bounds.size.height;
+    if (raw_w <= 10.0 || raw_h <= 10.0) { raw_w = 1024.0; raw_h = 768.0; }
+
+    double max_dim = fmax(raw_w, raw_h);
+    double min_dim = fmin(raw_w, raw_h);
+
+    /* PUBG Mobile (ShadowTrackerExtra) is always a landscape application.
+     * When telemetry is active, or raw_w > raw_h, or interface orientation is landscape,
+     * enforce landscape bounds. */
+    BOOL is_landscape = (ori == 3 || ori == 4 || raw_w > raw_h || g_snapshot.header.status >= 1);
     if (is_landscape) {
         if (ori == 4) g_current_orientation = 4;
+        else if (ori == 3) g_current_orientation = 3;
+        else if (dev_ori == 4) g_current_orientation = 4;
         else g_current_orientation = 3; /* Default LandscapeRight */
     } else {
         g_current_orientation = (ori >= 1 && ori <= 4) ? ori : 3;
@@ -2361,15 +2418,8 @@ static void timer_tick(id self, SEL cmd, id timer) {
         update_digitizer_sender_id();
     }
 
-    /* 4. Dynamic Screen Dimensions & Midpoint Refresh */
-    id mainScreen = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIScreen"), sel_registerName("mainScreen"));
-    CGRect cur_bounds = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, sel_registerName("bounds"));
-    double raw_w = cur_bounds.size.width;
-    double raw_h = cur_bounds.size.height;
-    if (raw_w <= 10.0 || raw_h <= 10.0) { raw_w = 375.0; raw_h = 812.0; }
-
-    double target_w = is_landscape ? fmax(raw_w, raw_h) : fmin(raw_w, raw_h);
-    double target_h = is_landscape ? fmin(raw_w, raw_h) : fmax(raw_w, raw_h);
+    double target_w = is_landscape ? max_dim : min_dim;
+    double target_h = is_landscape ? min_dim : max_dim;
     CGRect target_bounds = CGRectMake_f(0, 0, target_w, target_h);
 
     static NSInteger s_last_orientation = 0;
@@ -2380,7 +2430,14 @@ static void timer_tick(id self, SEL cmd, id timer) {
         g_screen_h = target_h;
         s_last_orientation = g_current_orientation;
 
-        if (g_window) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_window, sel_registerName("setFrame:"), target_bounds);
+        if (g_window) {
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(g_window, sel_registerName("setFrame:"), target_bounds);
+            id root_vc = ((id (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("rootViewController"));
+            if (root_vc) {
+                id rv = ((id (*)(id, SEL))objc_msgSend)(root_vc, sel_registerName("view"));
+                if (rv) ((void (*)(id, SEL, CGRect))objc_msgSend)(rv, sel_registerName("setFrame:"), target_bounds);
+            }
+        }
         if (g_esp_view) ((void (*)(id, SEL, CGRect))objc_msgSend)(g_esp_view, sel_registerName("setFrame:"), target_bounds);
 
         /* Adapt radar position for Landscape vs Portrait */
@@ -2399,8 +2456,8 @@ static void timer_tick(id self, SEL cmd, id timer) {
     BOOL aim_trigger_active = (g_aim_trigger_mode == 0) ? (g_aim_active && !g_aim_is_dragging) : YES;
 
     if (aim_enabled && aim_trigger_active && g_snapshot.header.status == 2 && g_snapshot.header.camera_valid) {
-        double screen_w = g_screen_w > 0 ? g_screen_w : 812.0;
-        double screen_h = g_screen_h > 0 ? g_screen_h : 375.0;
+        double screen_w = g_screen_w > 0 ? g_screen_w : max_dim;
+        double screen_h = g_screen_h > 0 ? g_screen_h : min_dim;
         if (is_landscape && screen_w < screen_h) {
             double tmp = screen_w; screen_w = screen_h; screen_h = tmp;
         }
@@ -2607,10 +2664,25 @@ static void timer_tick(id self, SEL cmd, id timer) {
 
     /* Periodic diagnostic logging */
     if (g_proof && g_frame_counter % 100 == 1) {
+        id root_vc = g_window ? ((id (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("rootViewController")) : nil;
+        id rv = root_vc ? ((id (*)(id, SEL))objc_msgSend)(root_vc, sel_registerName("view")) : nil;
+        CGRect wf = g_window ? ((CGRect (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("frame")) : (CGRect){{0,0},{0,0}};
+        CGRect wb = g_window ? ((CGRect (*)(id, SEL))objc_msgSend)(g_window, sel_registerName("bounds")) : (CGRect){{0,0},{0,0}};
+        CGRect rvf = rv ? ((CGRect (*)(id, SEL))objc_msgSend)(rv, sel_registerName("frame")) : (CGRect){{0,0},{0,0}};
+        CGRect rvb = rv ? ((CGRect (*)(id, SEL))objc_msgSend)(rv, sel_registerName("bounds")) : (CGRect){{0,0},{0,0}};
+        CGRect ef = g_esp_view ? ((CGRect (*)(id, SEL))objc_msgSend)(g_esp_view, sel_registerName("frame")) : (CGRect){{0,0},{0,0}};
+        CGRect eb = g_esp_view ? ((CGRect (*)(id, SEL))objc_msgSend)(g_esp_view, sel_registerName("bounds")) : (CGRect){{0,0},{0,0}};
         fprintf(g_proof, "timer=%d reads=%u draws=%u tick=%u status=%u players=%u scr=(%.0f,%.0f) mid=(%.1f,%.1f) ori=%ld menu=%d\n",
                 g_frame_counter, g_reads, g_draws, g_last_tick, g_snapshot.header.status,
                 g_snapshot.header.player_count, g_screen_w, g_screen_h,
                 g_screen_w / 2.0, g_screen_h / 2.0, (long)g_current_orientation, g_menu_open);
+        fprintf(g_proof, "DIAG_VIEWS: win_f=(%.0f,%.0f,%.0f,%.0f) win_b=(%.0f,%.0f,%.0f,%.0f) rv_f=(%.0f,%.0f,%.0f,%.0f) rv_b=(%.0f,%.0f,%.0f,%.0f) esp_f=(%.0f,%.0f,%.0f,%.0f) esp_b=(%.0f,%.0f,%.0f,%.0f)\n",
+                wf.origin.x, wf.origin.y, wf.size.width, wf.size.height,
+                wb.origin.x, wb.origin.y, wb.size.width, wb.size.height,
+                rvf.origin.x, rvf.origin.y, rvf.size.width, rvf.size.height,
+                rvb.origin.x, rvb.origin.y, rvb.size.width, rvb.size.height,
+                ef.origin.x, ef.origin.y, ef.size.width, ef.size.height,
+                eb.origin.x, eb.origin.y, eb.size.width, eb.size.height);
         fflush(g_proof);
     }
 }
@@ -2638,9 +2710,13 @@ static void vc_loadView(id self, SEL cmd) {
     Class UIScreen_cls = objc_getClass("UIScreen");
     id mainScreen = ((id (*)(id, SEL))objc_msgSend)((id)UIScreen_cls, sel_registerName("mainScreen"));
     CGRect b = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, sel_registerName("bounds"));
+    double max_dim = fmax(b.size.width, b.size.height);
+    double min_dim = fmin(b.size.width, b.size.height);
+    if (max_dim <= 10.0 || min_dim <= 10.0) { max_dim = 1024.0; min_dim = 768.0; }
     id v = ((id (*)(id, SEL, CGRect))objc_msgSend)(
         ((id (*)(id, SEL))objc_msgSend)((id)UIView_cls, sel_registerName("alloc")),
-        sel_registerName("initWithFrame:"), b);
+        sel_registerName("initWithFrame:"), CGRectMake_f(0, 0, max_dim, min_dim));
+    ((void (*)(id, SEL, NSUInteger))objc_msgSend)(v, sel_registerName("setAutoresizingMask:"), 18);
     ((void (*)(id, SEL, id))objc_msgSend)(self, sel_registerName("setView:"), v);
 }
 
@@ -2876,9 +2952,22 @@ static void init_overlay(void) {
 
     /* --- Screen & Window Setup --- */
     id mainScreen = ((id (*)(id, SEL))objc_msgSend)((id)UIScreen_cls, sel_registerName("mainScreen"));
-    CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, sel_registerName("bounds"));
-    g_screen_w = bounds.size.width;
-    g_screen_h = bounds.size.height;
+    CGRect raw_bounds = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, sel_registerName("bounds"));
+    double max_dim = fmax(raw_bounds.size.width, raw_bounds.size.height);
+    double min_dim = fmin(raw_bounds.size.width, raw_bounds.size.height);
+    if (max_dim <= 10.0 || min_dim <= 10.0) { max_dim = 1024.0; min_dim = 768.0; }
+    CGRect bounds = CGRectMake_f(0, 0, max_dim, min_dim);
+    g_screen_w = max_dim;
+    g_screen_h = min_dim;
+    g_current_orientation = 3;
+
+    Class UIDevice_cls = objc_getClass("UIDevice");
+    if (UIDevice_cls) {
+        id dev = ((id (*)(id, SEL))objc_msgSend)((id)UIDevice_cls, sel_registerName("currentDevice"));
+        if (dev && safe_responds(dev, "beginGeneratingDeviceOrientationNotifications")) {
+            ((void (*)(id, SEL))objc_msgSend)(dev, sel_registerName("beginGeneratingDeviceOrientationNotifications"));
+        }
+    }
 
     id window = ((id (*)(id, SEL, CGRect))objc_msgSend)(
         ((id (*)(id, SEL))objc_msgSend)((id)DisplayWindow, sel_registerName("alloc")),

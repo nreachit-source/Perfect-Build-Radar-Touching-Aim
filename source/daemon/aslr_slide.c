@@ -96,11 +96,34 @@ aslr_result_t aslr_get_slide(mach_port_t task)
     if (info_array_ptr == 0)
         return kFailed;
 
-    /* 4. Read the first entry's imageLoadAddress (pointer at +0x00). */
-    uint64_t base_addr = rm_read_ptr(task,
-                                     info_array_ptr + DYLD_IMG_OFF_LOAD_ADDR);
-    if (base_addr == 0)
-        return kFailed;
+    /* 4. Find the main executable's imageLoadAddress (mh.filetype == MH_EXECUTE).
+     * On iOS 16, entry [0] was the main binary, but on iPadOS 17+ embedded frameworks
+     * or dylibs may occupy the initial entries. We iterate infoArray to locate the
+     * actual executable. */
+    uint64_t base_addr = 0;
+    uint32_t limit = (info_array_count > 4096) ? 4096 : info_array_count;
+    for (uint32_t i = 0; i < limit; i++) {
+        uint64_t entry_addr = info_array_ptr + (uint64_t)i * DYLD_IMAGE_INFO_SIZE;
+        uint64_t load_addr = rm_read_ptr(task, entry_addr + DYLD_IMG_OFF_LOAD_ADDR);
+        if (!rm_validate_ptr(load_addr))
+            continue;
+
+        struct mach_header_64 cand_mh;
+        if (!rm_read(task, load_addr, &cand_mh, sizeof(cand_mh)))
+            continue;
+
+        if (cand_mh.magic == MH_MAGIC_64 && cand_mh.filetype == MH_EXECUTE) {
+            base_addr = load_addr;
+            break;
+        }
+    }
+
+    /* Fallback to entry 0 if MH_EXECUTE was not matched */
+    if (base_addr == 0) {
+        base_addr = rm_read_ptr(task, info_array_ptr + DYLD_IMG_OFF_LOAD_ADDR);
+        if (base_addr == 0)
+            return kFailed;
+    }
 
     /* 5. Read Mach-O header at the base address and verify magic. */
     struct mach_header_64 mh;

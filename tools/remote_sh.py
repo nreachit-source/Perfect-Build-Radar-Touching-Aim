@@ -62,7 +62,9 @@ def run_script(script_text, timeout=25):
                 except Exception:
                     pass
                 
-                cmd = "/var/jb/bin/sh /var/mobile/Media/" + name + "\n"
+                s.sendall(b"/var/jb/bin/sh\n")
+                time.sleep(0.2)
+                cmd = "export PATH=/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin\n/var/jb/bin/sh /var/mobile/Media/" + name + "\nexit\n"
                 s.sendall(cmd.encode('utf-8'))
                 s.settimeout(timeout)
                 out = b""

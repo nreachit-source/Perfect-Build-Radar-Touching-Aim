@@ -567,6 +567,7 @@ static uint64_t find_world(void) {
             return world;
         }
         local_player = 0;
+        world_cursor = 0;
     }
     world = 0;
     double now = now_seconds();
@@ -589,7 +590,7 @@ static uint64_t find_world(void) {
     }
 
     /* Fast batched search for LocalPlayer */
-    for (int b = 0; b < 16 && world_cursor >= 0; b++) {
+    for (int b = 0; b < 64 && world_cursor >= 0; b++) {
         uint64_t candidate = ue4r_find_instance(reflection, "LocalPlayer", &world_cursor);
         if (candidate) {
             uint64_t viewport = ptr(candidate, 0x58), w = ptr(viewport, 0x78), pc = ptr(candidate, 0x30);

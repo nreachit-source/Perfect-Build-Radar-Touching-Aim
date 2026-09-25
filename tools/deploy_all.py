@@ -112,15 +112,9 @@ launchctl kickstart -k system/com.local.ue4loadmonitor 2>/dev/null || true
     import update_artifacts
     update_artifacts.main()
 
-    print("==> 5. Ensuring game and SpringBoard are running cleanly...")
+    print("==> 5. Ensuring SpringBoard and game are running cleanly...")
     ensure_script = """
 export PATH=/var/jb/usr/bin:/var/jb/bin:$PATH
-# Check if game is running; if not, launch it
-if ! ps -ef | grep -v grep | grep -q ShadowTrackerExtra; then
-    uiopen --bundleid com.tencent.ig || true
-    sleep 3
-fi
-
 # Clear any safe mode flag from Dopamine
 rm -f /var/jb/basebin/.safe_mode
 
@@ -132,9 +126,15 @@ else
     killall -9 SpringBoard
 fi
 sleep 4
+
+# Check if game is running after SpringBoard reload; if not, launch it
+if ! ps -ef | grep -v grep | grep -q ShadowTrackerExtra; then
+    uiopen --bundleid com.tencent.ig || true
+    sleep 3
+fi
 """
     try:
-        run_script(ensure_script, timeout=12)
+        run_script(ensure_script, timeout=18)
     except Exception:
         pass
 
